@@ -1,0 +1,11 @@
+{
+  "distroName": "Ubuntu",
+  "linuxUser": "ubuntu",
+  "sshPort": 2222,
+  "imagePath": "artifacts\\ubuntu-ssh-image.tar",
+  "imageReleaseAssetName": "ubuntu-ssh-image.tar",
+  "installPath": "instances\\Ubuntu",
+  "programDataScriptPath": "C:\\ProgramData\\WslSshLan\\Update-WslSshLan.ps1",
+  "refreshTaskName": "WSL SSH LAN Refresh",
+  "keepAliveTaskName": "WSL Ubuntu KeepAlive"
+}
