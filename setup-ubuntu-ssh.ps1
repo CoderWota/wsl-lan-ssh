@@ -223,11 +223,32 @@ function Test-TaskExists {
   return [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
 }
 
+function Get-WslConfigContent {
+  return @(
+    "[wsl2]",
+    "networkingMode=nat",
+    "firewall=true",
+    "vmIdleTimeout=86400000"
+  )
+}
+
+function Remove-PortProxyForPort {
+  param([Parameter(Mandatory = $true)][int]$ListenPort)
+
+  $rows = Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "show", "v4tov4") -Description "List portproxy entries"
+  foreach ($row in $rows) {
+    if ($row -match "^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+($ListenPort)\s+\d{1,3}(?:\.\d{1,3}){3}\s+\d+\s*$") {
+      Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "delete", "v4tov4", "listenaddress=$($matches[1])", "listenport=$ListenPort") -Description "Delete portproxy $($matches[1])`:$ListenPort"
+    }
+  }
+}
+
 function Get-RefreshScriptContent {
   param(
     [Parameter(Mandatory = $true)][string]$DistroName,
     [Parameter(Mandatory = $true)][int]$Port,
-    [Parameter(Mandatory = $true)][string]$ExpectedListenAddress
+    [Parameter(Mandatory = $true)][string]$ExpectedListenAddress,
+    [Parameter(Mandatory = $true)][string]$ExpectedInterfaceAlias
   )
 
 @"
@@ -254,6 +275,7 @@ function Invoke-NativeCommand {
 `$Distro = "$DistroName"
 `$Port = $Port
 `$ExpectedListenAddress = "$ExpectedListenAddress"
+`$ExpectedInterfaceAlias = "$ExpectedInterfaceAlias"
 `$LogPath = "C:\ProgramData\WslSshLan\Update-WslSshLan.log"
 `$AllowRuleName = "WSL SSH LAN 2222"
 `$LegacyBlockRuleName = "WSL SSH Block Non-LAN 2222"
@@ -305,46 +327,84 @@ function Remove-PortProxyForPort {
 }
 
 function Get-TrustedLanConfig {
-  return Get-NetIPConfiguration |
+  `$candidates = @(Get-NetIPConfiguration |
     Where-Object {
-      `$_.IPv4Address.IPAddress -eq `$ExpectedListenAddress -and
       `$_.IPv4DefaultGateway -and
       `$_.NetAdapter.Status -eq "Up" -and
       `$_.IPv4Address.IPAddress -notlike "169.254.*" -and
       (`$_.NetProfile.NetworkCategory -eq "Private" -or `$_.NetProfile.NetworkCategory -eq "DomainAuthenticated")
-    } |
-    Sort-Object -Property InterfaceIndex |
-    Select-Object -First 1
+    })
+
+  if (`$ExpectedInterfaceAlias) {
+    `$matchedAlias = `$candidates | Where-Object { `$_.InterfaceAlias -eq `$ExpectedInterfaceAlias } | Sort-Object -Property InterfaceIndex | Select-Object -First 1
+    if (`$matchedAlias) {
+      return `$matchedAlias
+    }
+  }
+
+  if (`$ExpectedListenAddress) {
+    `$matchedAddress = `$candidates | Where-Object { `$_.IPv4Address.IPAddress -eq `$ExpectedListenAddress } | Sort-Object -Property InterfaceIndex | Select-Object -First 1
+    if (`$matchedAddress) {
+      return `$matchedAddress
+    }
+  }
+
+  if (`$candidates.Count -eq 1) {
+    return `$candidates[0]
+  }
+
+  return `$null
 }
 
 New-Item -ItemType Directory -Path (Split-Path -Parent `$LogPath) -Force | Out-Null
 
-`$lanConfig = Get-TrustedLanConfig
+`$lanConfig = `$null
+for (`$attempt = 1; `$attempt -le 60; `$attempt++) {
+  `$lanConfig = Get-TrustedLanConfig
+  if (`$lanConfig) {
+    break
+  }
+
+  Start-Sleep -Seconds 5
+}
+
 if (-not `$lanConfig) {
-  throw "Could not find the expected trusted LAN address `$ExpectedListenAddress."
+  throw "Could not find a trusted LAN interface matching `$ExpectedInterfaceAlias or `$ExpectedListenAddress."
 }
 
 `$listenAddress = `$lanConfig.IPv4Address.IPAddress
 
-Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "-u", "root", "--", "sh", "-lc", "systemctl disable --now ssh.socket >/dev/null 2>&1 || true; systemctl enable --now ssh.service >/dev/null 2>&1 || service ssh start >/dev/null 2>&1 || true") -Description "Prepare WSL ssh service"
+`$wslAddress = `$null
+`$listenCheck = `$null
+for (`$attempt = 1; `$attempt -le 60; `$attempt++) {
+  try {
+    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "-u", "root", "--", "sh", "-lc", "systemctl disable --now ssh.socket >/dev/null 2>&1 || true; systemctl enable --now ssh.service >/dev/null 2>&1 || service ssh start >/dev/null 2>&1 || true") -Description "Prepare WSL ssh service"
+    `$wslAddress = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "--", "sh", "-lc", "hostname -I | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1") -Description "Read WSL IPv4 address"
+    if (`$wslAddress) {
+      `$listenCheck = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "--", "sh", "-lc", "ss -ltnH '( sport = :`$Port )' 2>/dev/null | head -n 1") -Description "Verify WSL sshd listener"
+    }
+  } catch {
+    `$wslAddress = `$null
+    `$listenCheck = `$null
+  }
 
-`$wslAddress = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "--", "sh", "-lc", "hostname -I | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1") -Description "Read WSL IPv4 address"
+  if (`$wslAddress -and `$listenCheck) {
+    break
+  }
+
+  Start-Sleep -Seconds 5
+}
+
 if (-not `$wslAddress) {
   throw "Could not determine WSL IPv4 address."
 }
 
-`$listenCheck = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "--", "sh", "-lc", "ss -ltnH '( sport = :`$Port )' 2>/dev/null | head -n 1") -Description "Verify WSL sshd listener"
 if (-not `$listenCheck) {
   throw "WSL sshd is not listening on port `$Port."
 }
 
 Remove-NetFirewallRule -DisplayName `$LegacyBlockRuleName -ErrorAction SilentlyContinue
 Remove-NetFirewallRule -DisplayName `$LegacyPublicBlockRuleName -ErrorAction SilentlyContinue
-
-if (Get-Command Get-NetFirewallHyperVRule -ErrorAction SilentlyContinue) {
-  Get-NetFirewallHyperVRule -DisplayName `$LegacyPublicBlockRuleName -ErrorAction SilentlyContinue | Remove-NetFirewallHyperVRule -ErrorAction SilentlyContinue
-  Get-NetFirewallHyperVRule -DisplayName `$AllowRuleName -ErrorAction SilentlyContinue | Remove-NetFirewallHyperVRule -ErrorAction SilentlyContinue
-}
 
 `$portProxy = Get-PortProxyForPort -ListenAddress `$listenAddress -ListenPort `$Port
 if (
@@ -508,25 +568,24 @@ $sshdStartupType = $null
 $sshdWasRunning = $false
 $previewRuleEnabled = $null
 $stableRuleEnabled = $null
-
-if (Test-DistroExists -DistroName $manifest.distroName) {
-  throw "A distro named '$($manifest.distroName)' already exists. Setup stops on conflicts."
-}
+$distroAlreadyExists = Test-DistroExists -DistroName $manifest.distroName
 
 if (Test-Path -LiteralPath $wslConfigPath) {
-  throw "An existing .wslconfig was found at $wslConfigPath. Setup stops on conflicts."
+  Remove-Item -LiteralPath $wslConfigPath -Force
 }
 
 if (Test-TaskExists -TaskName $manifest.refreshTaskName) {
-  throw "A scheduled task named '$($manifest.refreshTaskName)' already exists. Setup stops on conflicts."
+  Stop-ScheduledTask -TaskName $manifest.refreshTaskName -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName $manifest.refreshTaskName -Confirm:$false
 }
 
 if (Test-TaskExists -TaskName $manifest.keepAliveTaskName) {
-  throw "A scheduled task named '$($manifest.keepAliveTaskName)' already exists. Setup stops on conflicts."
+  Stop-ScheduledTask -TaskName $manifest.keepAliveTaskName -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName $manifest.keepAliveTaskName -Confirm:$false
 }
 
 if (Test-Path -LiteralPath $programDataScriptPath) {
-  throw "An existing ProgramData refresh script was found at $programDataScriptPath. Setup stops on conflicts."
+  Remove-Item -LiteralPath $programDataScriptPath -Force
 }
 
 if ([string]::IsNullOrWhiteSpace($ListenAddress)) {
@@ -535,25 +594,37 @@ if ([string]::IsNullOrWhiteSpace($ListenAddress)) {
     $details = $candidates | ForEach-Object { "$($_.InterfaceAlias): $($_.IPAddress)" }
     throw "Could not auto-select a unique trusted LAN IPv4. Rerun with -ListenAddress. Candidates: $($details -join '; ')"
   }
-  $ListenAddress = $candidates[0].IPAddress
+  $listenConfig = $candidates[0]
 } else {
   $matchedCandidate = Get-TrustedLanCandidates | Where-Object { $_.IPAddress -eq $ListenAddress } | Select-Object -First 1
   if (-not $matchedCandidate) {
     throw "ListenAddress '$ListenAddress' is not an active trusted LAN IPv4 on this machine."
   }
+  $listenConfig = $matchedCandidate
 }
+
+$ListenAddress = $listenConfig.IPAddress
+$ListenInterfaceAlias = $listenConfig.InterfaceAlias
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $imagePath) -Force | Out-Null
 New-Item -ItemType Directory -Path (Split-Path -Parent $installPath) -Force | Out-Null
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 
-Ensure-ImagePresent -ImagePath $imagePath -RepositoryRoot $scriptRoot -Manifest $manifest
+if (-not $distroAlreadyExists) {
+  Ensure-ImagePresent -ImagePath $imagePath -RepositoryRoot $scriptRoot -Manifest $manifest
+}
 
 try {
-  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--import", $manifest.distroName, $installPath, $imagePath, "--version", "2") -Description "Import WSL distro"
-  $wslImported = $true
+  if (-not $distroAlreadyExists) {
+    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--import", $manifest.distroName, $installPath, $imagePath, "--version", "2") -Description "Import WSL distro"
+    $wslImported = $true
+  } else {
+    Write-Host "Existing WSL distro '$($manifest.distroName)' detected. Repairing in place."
+  }
+
   Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--set-default", $manifest.distroName) -Description "Set default WSL distro"
   Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--manage", $manifest.distroName, "--set-default-user", $manifest.linuxUser) -Description "Set default WSL user"
+  Remove-PortProxyForPort -ListenPort $manifest.sshPort
 
   $sshdService = Get-Service sshd -ErrorAction SilentlyContinue
   $sshdServiceExists = $null -ne $sshdService
@@ -579,15 +650,11 @@ try {
   }
 
   New-Item -ItemType Directory -Path $programDataDir -Force | Out-Null
-  $refreshScript = Get-RefreshScriptContent -DistroName $manifest.distroName -Port $manifest.sshPort -ExpectedListenAddress $ListenAddress
+  $refreshScript = Get-RefreshScriptContent -DistroName $manifest.distroName -Port $manifest.sshPort -ExpectedListenAddress $ListenAddress -ExpectedInterfaceAlias $ListenInterfaceAlias
   Set-Content -LiteralPath $programDataScriptPath -Value $refreshScript -Encoding UTF8
   $programDataScriptCreated = $true
 
-  Set-Content -LiteralPath $wslConfigPath -Value @(
-    "[wsl2]",
-    "networkingMode=nat",
-    "firewall=true"
-  ) -Encoding ASCII
+  Set-Content -LiteralPath $wslConfigPath -Value (Get-WslConfigContent) -Encoding ASCII
   $wslConfigCreated = $true
 
   $currentUser = Get-CurrentWindowsUser
@@ -619,6 +686,7 @@ try {
   $state = [ordered]@{
     windowsUser = $currentUser
     listenAddress = $ListenAddress
+    listenInterfaceAlias = $ListenInterfaceAlias
     distroName = $manifest.distroName
     linuxUser = $manifest.linuxUser
     imagePath = $imagePath
@@ -640,6 +708,7 @@ try {
 
   Write-Host "Setup complete."
   Write-Host "ListenAddress: $ListenAddress"
+  Write-Host "ListenInterfaceAlias: $ListenInterfaceAlias"
   Write-Host "Distro: $($manifest.distroName)"
   Write-Host "SSH: ssh -p $($manifest.sshPort) $($manifest.linuxUser)@$ListenAddress"
 }
@@ -669,3 +738,4 @@ catch {
   }
   throw
 }
+

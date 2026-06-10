@@ -12,7 +12,8 @@ This repository captures a restorable WSL2 Ubuntu instance and the Windows-side 
   - Single source of truth for distro name, Linux user, SSH port, task names, and paths
 - `setup-ubuntu-ssh.ps1`
   - Restores the Ubuntu instance from the tar image
-  - Rebuilds host-side NAT SSH forwarding, firewall rule, scheduled tasks, and keep-alive behavior
+  - Rebuilds host-side SSH forwarding, firewall rule, scheduled tasks, and keep-alive behavior
+  - Rebinds the LAN listener from the active interface on every boot so DHCP changes do not break SSH
 - `uninstall-ubuntu-ssh.ps1`
   - Removes the imported distro and host-side runtime configuration
   - Preserves the tar image, manifest, and scripts for later reuse
@@ -33,6 +34,7 @@ The setup flow is designed for a clean Windows host:
 - exposes SSH to devices on the local subnet through Windows `portproxy`
 - disables Windows host `sshd` to avoid exposing port `22`
 - recreates the forwarding path automatically after reboot via scheduled tasks
+- keeps the WSL VM alive after boot so the SSH daemon stays reachable without a manual login
 
 ## Usage
 
@@ -44,6 +46,8 @@ Run from an elevated PowerShell session.
 .\setup-ubuntu-ssh.ps1
 .\setup-ubuntu-ssh.ps1 -ListenAddress 192.0.2.10
 ```
+
+If an `Ubuntu` distro already exists, setup repairs it in place instead of forcing a reinstall.
 
 If WSL features are not enabled yet, the script enables them and exits. After reboot, run the same command again.
 
@@ -84,8 +88,9 @@ This keeps:
 
 ## Safety notes
 
-- `setup-ubuntu-ssh.ps1` stops on conflicts instead of overwriting existing `Ubuntu`, `.wslconfig`, scheduled tasks, or `ProgramData` scripts.
-- `.wslconfig` is written with `networkingMode=nat` and `firewall=true`.
+- `setup-ubuntu-ssh.ps1` repairs an existing `Ubuntu` distro in place, and refreshes `.wslconfig`, scheduled tasks, and `ProgramData` scripts as needed.
+- `.wslconfig` is written with `networkingMode=nat`, `firewall=true`, and `vmIdleTimeout=86400000` to reduce idle shutdowns and stale forwarding state.
+- the refresh task retries until the LAN interface and WSL SSH listener are both ready, then rewrites the Windows `portproxy` and firewall rules
 - the Windows firewall allow rule is scoped to `Domain,Private`, `LocalSubnet`, and TCP `2222`
 - the WSL sshd policy remains password-based by design for broad client compatibility on the LAN
 
@@ -145,3 +150,4 @@ For private use, the simplest path is often:
 4. run `.\setup-ubuntu-ssh.ps1`
 
 This repository is already prepared for that workflow.
+
