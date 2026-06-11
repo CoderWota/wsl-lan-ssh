@@ -2,7 +2,9 @@
 param(
   [string]$ListenAddress,
   [securestring]$LinuxPassword,
-  [switch]$ResetLinuxPassword
+  [switch]$ResetLinuxPassword,
+  [switch]$AllowConsolePasswordPrompt,
+  [switch]$ShowProgressBar
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +31,24 @@ Initialize-Utf8Output
 
 $script:SetupStatusTotalSteps = 9
 
+function Initialize-ConsolePresentation {
+  if (-not [Environment]::UserInteractive) {
+    return
+  }
+
+  $global:ProgressPreference = "SilentlyContinue"
+
+  try {
+    if ($Host.Name -eq "ConsoleHost") {
+      Clear-Host
+    }
+  } catch {
+    Write-Verbose "Console cleanup was skipped. $($_.Exception.Message)"
+  }
+}
+
+Initialize-ConsolePresentation
+
 function Write-SetupStatus {
   param(
     [Parameter(Mandatory = $true)][int]$Step,
@@ -36,15 +56,21 @@ function Write-SetupStatus {
   )
 
   $boundedStep = [Math]::Min([Math]::Max($Step, 1), $script:SetupStatusTotalSteps)
-  $percentComplete = [int][Math]::Floor((($boundedStep - 1) * 100) / $script:SetupStatusTotalSteps)
-  Write-Progress -Activity "Setting up WSL Ubuntu SSH" -Status $Message -PercentComplete $percentComplete
+  if ($ShowProgressBar) {
+    $percentComplete = [int][Math]::Floor((($boundedStep - 1) * 100) / $script:SetupStatusTotalSteps)
+    Write-Progress -Activity "Setting up WSL Ubuntu SSH" -Status $Message -PercentComplete $percentComplete
+  }
+
   Write-Output "[Step $boundedStep/$($script:SetupStatusTotalSteps)] $Message"
 }
 
 function Complete-SetupStatus {
   param([Parameter(Mandatory = $true)][string]$Message)
 
-  Write-Progress -Activity "Setting up WSL Ubuntu SSH" -Status $Message -PercentComplete 100 -Completed
+  if ($ShowProgressBar) {
+    Write-Progress -Activity "Setting up WSL Ubuntu SSH" -Status $Message -PercentComplete 100 -Completed
+  }
+
   Write-Output $Message
 }
 
@@ -161,17 +187,19 @@ function Write-LinuxTextFile {
   )
 
   $directory = if ($Path -match '^(.+)/[^/]+$') { $matches[1] } else { "." }
+  $base64Text = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
   $quotedDirectory = ConvertTo-LinuxSingleQuotedText -Text $directory
   $quotedPath = ConvertTo-LinuxSingleQuotedText -Text $Path
+  $quotedBase64Text = ConvertTo-LinuxSingleQuotedText -Text $base64Text
   $shellCommand = "umask 077; /bin/mkdir -p $quotedDirectory"
   if ($PSBoundParameters.ContainsKey("DirectoryMode") -and -not [string]::IsNullOrWhiteSpace($DirectoryMode)) {
     $shellCommand += "; /bin/chmod $DirectoryMode $quotedDirectory"
   }
-  $shellCommand += "; /bin/cat > $quotedPath"
+  $shellCommand += "; /usr/bin/printf '%s' $quotedBase64Text | /usr/bin/base64 --decode > $quotedPath"
   if ($PSBoundParameters.ContainsKey("FileMode") -and -not [string]::IsNullOrWhiteSpace($FileMode)) {
     $shellCommand += "; /bin/chmod $FileMode $quotedPath"
   }
-  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/bin/sh", "-c", $shellCommand) -InputText $Text -Description "Write Linux file '$Path'"
+  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/bin/sh", "-c", $shellCommand) -Description "Write Linux file '$Path'"
 }
 
 function Get-DefaultSetupProfile {
@@ -197,6 +225,17 @@ function Get-LinuxPasswordValidationError {
     return "The Linux password cannot contain a colon or newline."
   }
 
+  if ($CandidateText -match "^\s" -or $CandidateText -match "\s$") {
+    return "The Linux password cannot start or end with whitespace."
+  }
+
+  foreach ($character in $CandidateText.ToCharArray()) {
+    $codePoint = [int][char]$character
+    if ($codePoint -lt 33 -or $codePoint -gt 126) {
+      return "The Linux password must use visible ASCII characters only. Switch to an English keyboard/input mode and avoid full-width or non-ASCII characters."
+    }
+  }
+
   return $null
 }
 
@@ -208,12 +247,191 @@ function Test-InteractivePromptAvailable {
   }
 }
 
-function Read-InteractiveLinuxPassword {
+function Test-GuiPromptAvailable {
+  try {
+    if (-not [Environment]::UserInteractive) {
+      return $false
+    }
+
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Get-LinuxPasswordStatusMessage {
+  param(
+    [AllowEmptyString()][string]$CandidateText,
+    [AllowEmptyString()][string]$ConfirmText
+  )
+
+  $validationError = Get-LinuxPasswordValidationError -CandidateText $CandidateText
+  if ($validationError) {
+    return [pscustomobject]@{
+      IsReady = $false
+      Message = $validationError
+    }
+  }
+
+  if ($CandidateText -ne $ConfirmText) {
+    return [pscustomobject]@{
+      IsReady = $false
+      Message = "The two password entries do not match yet."
+    }
+  }
+
+  return [pscustomobject]@{
+    IsReady = $true
+    Message = "Password looks valid. You can continue."
+  }
+}
+
+function ConvertFrom-VisibleTextToSecureString {
+  param([Parameter(Mandatory = $true)][string]$Text)
+
+  $secureText = [securestring]::new()
+  foreach ($character in $Text.ToCharArray()) {
+    $secureText.AppendChar($character)
+  }
+
+  $secureText.MakeReadOnly()
+  return $secureText
+}
+
+function Read-GuiLinuxPassword {
   param([Parameter(Mandatory = $true)][string]$LinuxUser)
+
+  $form = [System.Windows.Forms.Form]::new()
+  $form.Text = "Set Linux Password"
+  $form.StartPosition = "CenterScreen"
+  $form.FormBorderStyle = "FixedDialog"
+  $form.MaximizeBox = $false
+  $form.MinimizeBox = $false
+  $form.ClientSize = [System.Drawing.Size]::new(520, 288)
+  $form.TopMost = $true
+
+  $introLabel = [System.Windows.Forms.Label]::new()
+  $introLabel.Location = [System.Drawing.Point]::new(16, 16)
+  $introLabel.Size = [System.Drawing.Size]::new(488, 58)
+  $introLabel.Text = "Enter a password for Linux user '$LinuxUser'. This dialog keeps the password visible by default so you can verify it before the script writes anything."
+  $form.Controls.Add($introLabel)
+
+  $passwordLabel = [System.Windows.Forms.Label]::new()
+  $passwordLabel.Location = [System.Drawing.Point]::new(16, 82)
+  $passwordLabel.Size = [System.Drawing.Size]::new(180, 20)
+  $passwordLabel.Text = "Password"
+  $form.Controls.Add($passwordLabel)
+
+  $passwordBox = [System.Windows.Forms.TextBox]::new()
+  $passwordBox.Location = [System.Drawing.Point]::new(16, 102)
+  $passwordBox.Size = [System.Drawing.Size]::new(488, 24)
+  $passwordBox.UseSystemPasswordChar = $false
+  $passwordBox.ImeMode = [System.Windows.Forms.ImeMode]::Disable
+  $form.Controls.Add($passwordBox)
+
+  $confirmLabel = [System.Windows.Forms.Label]::new()
+  $confirmLabel.Location = [System.Drawing.Point]::new(16, 136)
+  $confirmLabel.Size = [System.Drawing.Size]::new(180, 20)
+  $confirmLabel.Text = "Confirm password"
+  $form.Controls.Add($confirmLabel)
+
+  $confirmBox = [System.Windows.Forms.TextBox]::new()
+  $confirmBox.Location = [System.Drawing.Point]::new(16, 156)
+  $confirmBox.Size = [System.Drawing.Size]::new(488, 24)
+  $confirmBox.UseSystemPasswordChar = $false
+  $confirmBox.ImeMode = [System.Windows.Forms.ImeMode]::Disable
+  $form.Controls.Add($confirmBox)
+
+  $showPasswordCheckBox = [System.Windows.Forms.CheckBox]::new()
+  $showPasswordCheckBox.Location = [System.Drawing.Point]::new(16, 194)
+  $showPasswordCheckBox.Size = [System.Drawing.Size]::new(210, 24)
+  $showPasswordCheckBox.Text = "Hide characters while typing"
+  $showPasswordCheckBox.Checked = $false
+  $form.Controls.Add($showPasswordCheckBox)
+
+  $statusLabel = [System.Windows.Forms.Label]::new()
+  $statusLabel.Location = [System.Drawing.Point]::new(16, 222)
+  $statusLabel.Size = [System.Drawing.Size]::new(488, 32)
+  $statusLabel.Text = "Use visible ASCII characters only. No spaces at the start or end."
+  $form.Controls.Add($statusLabel)
+
+  $okButton = [System.Windows.Forms.Button]::new()
+  $okButton.Location = [System.Drawing.Point]::new(348, 252)
+  $okButton.Size = [System.Drawing.Size]::new(75, 26)
+  $okButton.Text = "OK"
+  $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $form.Controls.Add($okButton)
+
+  $cancelButton = [System.Windows.Forms.Button]::new()
+  $cancelButton.Location = [System.Drawing.Point]::new(429, 252)
+  $cancelButton.Size = [System.Drawing.Size]::new(75, 26)
+  $cancelButton.Text = "Cancel"
+  $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $form.Controls.Add($cancelButton)
+
+  $form.AcceptButton = $okButton
+  $form.CancelButton = $cancelButton
+
+  $updatePasswordUi = {
+    $hideCharacters = $showPasswordCheckBox.Checked
+    $passwordBox.UseSystemPasswordChar = $hideCharacters
+    $confirmBox.UseSystemPasswordChar = $hideCharacters
+
+    $status = Get-LinuxPasswordStatusMessage -CandidateText $passwordBox.Text -ConfirmText $confirmBox.Text
+    $statusLabel.Text = "{0} Length: {1}" -f $status.Message, $passwordBox.Text.Length
+    $statusLabel.ForeColor = if ($status.IsReady) { [System.Drawing.Color]::DarkGreen } else { [System.Drawing.Color]::DarkRed }
+    $okButton.Enabled = $status.IsReady
+  }
+
+  $passwordBox.Add_TextChanged($updatePasswordUi)
+  $confirmBox.Add_TextChanged($updatePasswordUi)
+  $showPasswordCheckBox.Add_CheckedChanged($updatePasswordUi)
+
+  while ($true) {
+    $passwordBox.Text = ""
+    $confirmBox.Text = ""
+    $null = $form.ActiveControl = $passwordBox
+    & $updatePasswordUi
+    $dialogResult = $form.ShowDialog()
+
+    if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK) {
+      $form.Dispose()
+      throw "Linux password entry was canceled."
+    }
+
+    $status = Get-LinuxPasswordStatusMessage -CandidateText $passwordBox.Text -ConfirmText $confirmBox.Text
+    if (-not $status.IsReady) {
+      [System.Windows.Forms.MessageBox]::Show($status.Message, "Invalid Linux Password", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+      continue
+    }
+
+    $securePassword = ConvertFrom-VisibleTextToSecureString -Text $passwordBox.Text
+    $form.Dispose()
+    return $securePassword
+  }
+}
+
+function Read-InteractiveLinuxPassword {
+  param(
+    [Parameter(Mandatory = $true)][string]$LinuxUser,
+    [switch]$AllowConsoleFallback
+  )
 
   if (-not (Test-InteractivePromptAvailable)) {
     throw "A Linux password is required, but this session cannot prompt interactively. Rerun setup in an elevated interactive PowerShell window, or pass -LinuxPassword."
   }
+
+  if (Test-GuiPromptAvailable) {
+    return Read-GuiLinuxPassword -LinuxUser $LinuxUser
+  }
+
+  if (-not $AllowConsoleFallback) {
+    throw "A graphical password dialog is not available in this session, and console password prompting is disabled by default because it can hide or distort what you typed. Rerun setup from a normal desktop PowerShell session, pass -LinuxPassword, or explicitly use -AllowConsolePasswordPrompt if you accept the console fallback."
+  }
+
+  Write-Output "Password entry is hidden in PowerShell. To avoid accidental extra characters, switch to an English keyboard/input mode and use visible ASCII characters only."
 
   while ($true) {
     $passwordSecure = Read-Host -AsSecureString -Prompt "Enter a password for Linux user '$LinuxUser'"
@@ -287,8 +505,8 @@ function Read-OrCreate-SetupProfile {
   $passwordActionMessage = $null
   $userAlreadyPresent = Test-LinuxUserPresent -DistroName $DistroName -LinuxUser $linuxUser
   if ($PSBoundParameters.ContainsKey("LinuxPassword")) {
-    $providedPasswordText = Convert-SecureStringToPlainText -SecureString $LinuxPassword
-    $validationError = Get-LinuxPasswordValidationError -CandidateText $providedPasswordText
+    $providedCandidateText = Convert-SecureStringToPlainText -SecureString $LinuxPassword
+    $validationError = Get-LinuxPasswordValidationError -CandidateText $providedCandidateText
     if ($validationError) {
       throw $validationError
     }
@@ -299,7 +517,7 @@ function Read-OrCreate-SetupProfile {
     } else {
       $passwordActionMessage = "No password is set through this repository yet for Linux user '$linuxUser'. Setup will prompt for one now."
     }
-    $passwordSecure = Read-InteractiveLinuxPassword -LinuxUser $linuxUser
+    $passwordSecure = Read-InteractiveLinuxPassword -LinuxUser $linuxUser -AllowConsoleFallback:$AllowConsolePasswordPrompt
     $promptedForPassword = $true
   }
 
@@ -344,6 +562,95 @@ function Test-LinuxUserPresent {
   }
 }
 
+function Get-LinuxPasswordHash {
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][securestring]$PasswordSecure,
+    [string]$Salt
+  )
+
+  $plainPassword = Convert-SecureStringToPlainText -SecureString $PasswordSecure
+  $opensslArguments = @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/openssl", "passwd", "-6")
+  if (-not [string]::IsNullOrWhiteSpace($Salt)) {
+    $opensslArguments += @("-salt", $Salt)
+  }
+  $opensslArguments += $plainPassword
+
+  $mkpasswdArguments = @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/mkpasswd", "-m", "sha-512")
+  if (-not [string]::IsNullOrWhiteSpace($Salt)) {
+    $mkpasswdArguments += @("-S", $Salt)
+  }
+  $mkpasswdArguments += $plainPassword
+
+  $hashGenerators = @(
+    @{
+      Description = "Generate password hash with openssl in distro '$DistroName'"
+      Arguments = $opensslArguments
+      Prefix = '$6$'
+    },
+    @{
+      Description = "Generate password hash with mkpasswd in distro '$DistroName'"
+      Arguments = $mkpasswdArguments
+      Prefix = '$6$'
+    }
+  )
+
+  foreach ($generator in $hashGenerators) {
+    try {
+      $passwordHash = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments $generator.Arguments -Description $generator.Description
+      $passwordHashText = (@($passwordHash) -join "").Trim()
+      if (-not [string]::IsNullOrWhiteSpace($passwordHashText) -and $passwordHashText.StartsWith($generator.Prefix)) {
+        return $passwordHashText
+      }
+    } catch {
+      Write-Verbose $_.Exception.Message
+    }
+  }
+
+  throw "Could not generate a usable SHA-512 password hash in distro '$DistroName'. Install /usr/bin/openssl or /usr/bin/mkpasswd inside the distro and rerun setup."
+}
+
+function Test-LinuxPasswordMatchesStoredHash {
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$LinuxUser,
+    [Parameter(Mandatory = $true)][securestring]$PasswordSecure
+  )
+
+  $quotedLinuxUser = ConvertTo-LinuxSingleQuotedText -Text $LinuxUser
+  $readShadowCommand = "/usr/bin/getent shadow $quotedLinuxUser | /usr/bin/cut -d: -f2"
+  $shadowHash = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/bin/sh", "-lc", $readShadowCommand) -Description "Read password hash for Linux user '$LinuxUser'"
+  $shadowHashText = (@($shadowHash) -join "").Trim()
+  if ([string]::IsNullOrWhiteSpace($shadowHashText) -or $shadowHashText -eq "!" -or $shadowHashText -eq "*") {
+    throw "Linux user '$LinuxUser' does not have a usable password hash after setup."
+  }
+
+  if ($shadowHashText -notmatch '^\$6\$([^$]+)\$') {
+    throw "Linux user '$LinuxUser' does not have a SHA-512 password hash after setup."
+  }
+
+  $storedSalt = $matches[1]
+  $candidateHash = Get-LinuxPasswordHash -DistroName $DistroName -PasswordSecure $PasswordSecure -Salt $storedSalt
+  return $candidateHash -eq $shadowHashText
+}
+
+function Invoke-LinuxShadowPasswordHashUpdate {
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$LinuxUser,
+    [Parameter(Mandatory = $true)][string]$ShadowHashText
+  )
+
+  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @(
+    "--distribution", $DistroName,
+    "--user", "root",
+    "--exec", "/usr/sbin/usermod",
+    "--password",
+    $ShadowHashText,
+    $LinuxUser
+  ) -Description "Apply password hash to Linux user '$LinuxUser'"
+}
+
 function Set-LinuxUserConfigured {
   [CmdletBinding(SupportsShouldProcess = $true)]
   param(
@@ -364,8 +671,11 @@ function Set-LinuxUserConfigured {
     }
 
     if ($PSBoundParameters.ContainsKey("PasswordSecure")) {
-      $plainPassword = Convert-SecureStringToPlainText -SecureString $PasswordSecure
-      Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/sbin/chpasswd") -InputText ("{0}:{1}" -f $LinuxUser, $plainPassword) -Description "Set password for Linux user '$LinuxUser'"
+      $passwordHash = Get-LinuxPasswordHash -DistroName $DistroName -PasswordSecure $PasswordSecure
+      Invoke-LinuxShadowPasswordHashUpdate -DistroName $DistroName -LinuxUser $LinuxUser -ShadowHashText $passwordHash
+      if (-not (Test-LinuxPasswordMatchesStoredHash -DistroName $DistroName -LinuxUser $LinuxUser -PasswordSecure $PasswordSecure)) {
+        throw "The Linux password for user '$LinuxUser' was written, but the stored shadow entry does not authenticate the value entered during setup. Retry the password step."
+      }
     }
   }
 }

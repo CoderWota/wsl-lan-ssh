@@ -169,7 +169,21 @@ Before you run setup, make sure:
 
 By default, setup automatically chooses a suitable LAN IPv4 address from an active `Private` or `DomainAuthenticated` adapter.
 
-If the Linux user does not exist yet, setup will ask you to enter and confirm a password. That password must be at least 8 characters long and must not contain a colon or newline.
+Setup now uses plain text step messages by default instead of a PowerShell progress bar, because `Write-Progress` can corrupt or overlap console rendering in some Windows sessions. If you explicitly want the old progress bar, pass `-ShowProgressBar`.
+
+If the Linux user does not exist yet, setup will ask you to enter and confirm a password. On a normal Windows desktop session, setup now opens a small password dialog instead of relying on hidden console entry. The dialog keeps characters visible by default, disables IME input for the password fields, shows whether the two entries match, and only enables confirmation when the password passes validation. That password must be at least 8 characters long, must not contain a colon or newline, must not start or end with whitespace, and must use visible ASCII characters only.
+
+After setup captures the Linux password, it generates a SHA-512 password hash inside WSL, applies that hash to the Linux account with `usermod --password`, and then checks that the stored shadow entry authenticates the value entered during setup before continuing. If that check fails, setup stops and asks you to retry the password step instead of leaving SSH in a half-working state.
+
+If a graphical password dialog is not available, setup now stops by default instead of silently falling back to hidden console password entry. That is intentional: the console path is the one most likely to hide or distort what you typed.
+
+If you truly need the old console fallback, you can opt into it explicitly:
+
+```powershell
+.\setup-ubuntu-ssh.ps1 -AllowConsolePasswordPrompt
+```
+
+When you use that fallback, switch to an English keyboard or input mode first so you do not accidentally save full-width or other unexpected characters.
 
 ### Choose a specific listen address
 

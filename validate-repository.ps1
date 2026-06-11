@@ -117,6 +117,8 @@ $errors = $null
 $setupAst = [System.Management.Automation.Language.Parser]::ParseFile($setupPath, [ref]$tokens, [ref]$errors)
 Assert-Condition -Condition ($errors.Count -eq 0) -Message "setup-ubuntu-ssh.ps1 has parse errors."
 $setupContent = Get-Content -LiteralPath $setupPath -Raw
+Set-Variable -Name ShowProgressBar -Value $false
+Set-Variable -Name AllowConsolePasswordPrompt -Value $false
 $relayTemplateContent = Get-Content -LiteralPath $relayTypeDefinitionTemplatePath -Raw -Encoding UTF8
 Assert-Condition -Condition ($setupContent -match "Initialize-Utf8Output") -Message "setup-ubuntu-ssh.ps1 must initialize UTF-8 output."
 Assert-Condition -Condition ($relayTemplateContent -match "File\.AppendAllText\(\s*_logPath,\s*line \+ Environment\.NewLine,\s*new UTF8Encoding\(false\)\s*\)") -Message "Relay logs must be appended with UTF-8 encoding."
@@ -146,7 +148,12 @@ Assert-Condition -Condition (-not ($manifest.PSObject.Properties.Name -contains 
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Read-LinuxTextFile")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Write-LinuxTextFile")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-DefaultSetupProfile")
+. (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-LinuxPasswordValidationError")
+. (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-LinuxPasswordStatusMessage")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Read-OrCreate-SetupProfile")
+. (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-LinuxPasswordHash")
+. (Get-FunctionScriptBlock -Ast $setupAst -Name "Test-LinuxPasswordMatchesStoredHash")
+. (Get-FunctionScriptBlock -Ast $setupAst -Name "Invoke-LinuxShadowPasswordHashUpdate")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Set-LinuxUserConfigured")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-RelayScriptContent")
 
@@ -186,18 +193,34 @@ $setupScriptChecks = @(
   "wslConfigBackupContent",
   "Read-Host -AsSecureString",
   "ResetLinuxPassword",
+  "AllowConsolePasswordPrompt",
+  "ShowProgressBar",
   "Test-InteractivePromptAvailable",
-  "cannot prompt interactively"
+  "cannot prompt interactively",
+  "ImeMode",
+  "/usr/sbin/usermod",
+  "base64 --decode"
 )
 foreach ($needle in $setupScriptChecks) {
   Assert-Condition -Condition ($setupContent -match [regex]::Escape($needle)) -Message "setup-ubuntu-ssh.ps1 must contain '$needle'."
 }
 Assert-Condition -Condition (-not ($setupContent -match "Guid\(\)::NewGuid|NewGuid\(\)")) -Message "setup-ubuntu-ssh.ps1 must not generate a default Linux password."
+Assert-Condition -Condition ($setupContent -match 'if \s*\(\$ShowProgressBar\)') -Message "setup-ubuntu-ssh.ps1 must gate Write-Progress behind ShowProgressBar."
+Assert-Condition -Condition ($setupContent -match 'graphical password dialog is not available.*console password prompting is disabled by default') -Message "setup-ubuntu-ssh.ps1 must refuse console password prompting by default."
+Assert-Condition -Condition ($setupContent -match '/usr/bin/openssl.*passwd.*-6' -or $setupContent -match '/usr/bin/mkpasswd.*-m.*sha-512') -Message "setup-ubuntu-ssh.ps1 must generate SHA-512 password hashes inside WSL."
+Assert-Condition -Condition ($setupContent -match 'Invoke-LinuxShadowPasswordHashUpdate') -Message "setup-ubuntu-ssh.ps1 must apply the generated password hash through a dedicated helper."
+Assert-Condition -Condition ($setupContent -match '/usr/sbin/usermod' -and $setupContent -match '"--password"') -Message "setup-ubuntu-ssh.ps1 must apply the generated password hash with usermod."
+Assert-Condition -Condition ($setupContent -match 'Test-LinuxPasswordMatchesStoredHash') -Message "setup-ubuntu-ssh.ps1 must verify that the stored shadow hash authenticates the entered password."
 
 $defaultSetupProfile = Get-DefaultSetupProfile -DefaultLinuxUser $setupDefaults.defaultLinuxUser
 Assert-Condition -Condition ($defaultSetupProfile.Contains("linuxUser")) -Message "Default setup profile must contain linuxUser."
 Assert-Condition -Condition (-not $defaultSetupProfile.Contains("linuxPassword")) -Message "Default setup profile must not contain a generated password."
 
+$validPasswordStatus = Get-LinuxPasswordStatusMessage -CandidateText "AsciiPass123!" -ConfirmText "AsciiPass123!"
+Assert-Condition -Condition $validPasswordStatus.IsReady -Message "A valid ASCII password should be accepted by Get-LinuxPasswordStatusMessage."
+$fullWidthCandidate = ([char]0xFF21) + "bcdef12"
+$invalidPasswordStatus = Get-LinuxPasswordStatusMessage -CandidateText $fullWidthCandidate -ConfirmText $fullWidthCandidate
+Assert-Condition -Condition (-not $invalidPasswordStatus.IsReady) -Message "A password containing non-ASCII characters must be rejected by Get-LinuxPasswordStatusMessage."
 $generatedRelayScript = Get-RelayScriptContent -TemplatePath $relayTypeDefinitionTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $validateFixtures.preferredListenAddress -PreferredInterfaceAlias $validateFixtures.preferredInterfaceAlias
 Assert-Condition -Condition ($generatedRelayScript -match "TcpListener") -Message "Generated relay script does not create a TCP listener."
 Assert-Condition -Condition ($generatedRelayScript -match "WslSshRelay") -Message "Generated relay script does not define the relay class."
