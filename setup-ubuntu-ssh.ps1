@@ -27,6 +27,27 @@ function Initialize-Utf8Output {
 
 Initialize-Utf8Output
 
+$script:SetupStatusTotalSteps = 9
+
+function Write-SetupStatus {
+  param(
+    [Parameter(Mandatory = $true)][int]$Step,
+    [Parameter(Mandatory = $true)][string]$Message
+  )
+
+  $boundedStep = [Math]::Min([Math]::Max($Step, 1), $script:SetupStatusTotalSteps)
+  $percentComplete = [int][Math]::Floor((($boundedStep - 1) * 100) / $script:SetupStatusTotalSteps)
+  Write-Progress -Activity "Setting up WSL Ubuntu SSH" -Status $Message -PercentComplete $percentComplete
+  Write-Output "[Step $boundedStep/$($script:SetupStatusTotalSteps)] $Message"
+}
+
+function Complete-SetupStatus {
+  param([Parameter(Mandatory = $true)][string]$Message)
+
+  Write-Progress -Activity "Setting up WSL Ubuntu SSH" -Status $Message -PercentComplete 100 -Completed
+  Write-Output $Message
+}
+
 function Test-IsAdministrator {
   $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
@@ -263,6 +284,7 @@ function Read-OrCreate-SetupProfile {
 
   $passwordSecure = $null
   $promptedForPassword = $false
+  $passwordActionMessage = $null
   $userAlreadyPresent = Test-LinuxUserPresent -DistroName $DistroName -LinuxUser $linuxUser
   if ($PSBoundParameters.ContainsKey("LinuxPassword")) {
     $providedPasswordText = Convert-SecureStringToPlainText -SecureString $LinuxPassword
@@ -273,9 +295,9 @@ function Read-OrCreate-SetupProfile {
     $passwordSecure = $LinuxPassword
   } elseif ($ResetLinuxPassword -or -not $userAlreadyPresent) {
     if ($ResetLinuxPassword) {
-      Write-Output "Resetting the Linux password for user '$linuxUser'."
+      $passwordActionMessage = "Resetting the Linux password for user '$linuxUser'."
     } else {
-      Write-Output "No password is set through this repository yet for Linux user '$linuxUser'. Setup will prompt for one now."
+      $passwordActionMessage = "No password is set through this repository yet for Linux user '$linuxUser'. Setup will prompt for one now."
     }
     $passwordSecure = Read-InteractiveLinuxPassword -LinuxUser $linuxUser
     $promptedForPassword = $true
@@ -288,6 +310,7 @@ function Read-OrCreate-SetupProfile {
     Created = -not $config
     Updated = $shouldWrite -and $config
     PromptedForPassword = $promptedForPassword
+    PasswordActionMessage = $passwordActionMessage
     UserAlreadyPresent = $userAlreadyPresent
   }
 }
@@ -624,10 +647,10 @@ function Restore-PartialSetup {
     [Parameter(Mandatory = $true)][bool]$SshdStateChanged,
     [Parameter(Mandatory = $true)][bool]$FirewallRulesChanged,
     [Parameter(Mandatory = $true)][bool]$SshdServiceExists,
-    [Parameter(Mandatory = $true)]$SshdStartupType,
+    [AllowNull()]$SshdStartupType,
     [Parameter(Mandatory = $true)][bool]$SshdWasRunning,
-    [Parameter(Mandatory = $true)]$PreviewRuleEnabled,
-    [Parameter(Mandatory = $true)]$StableRuleEnabled,
+    [AllowNull()]$PreviewRuleEnabled,
+    [AllowNull()]$StableRuleEnabled,
     [Parameter(Mandatory = $true)][string]$DistroName,
     [Parameter(Mandatory = $true)][string]$ProgramDataScriptPath,
     [Parameter(Mandatory = $true)][string]$WslConfigPath,
@@ -735,6 +758,7 @@ $wslConfigPath = Join-Path $env:USERPROFILE ".wslconfig"
 $wslConfigHadExistingFile = Test-Path -LiteralPath $wslConfigPath
 $wslConfigBackupContent = Read-TextFileIfPresent -Path $wslConfigPath
 
+Write-SetupStatus -Step 1 -Message "Checking Windows prerequisites and WSL features."
 $rebootNeeded = Enable-WslFeaturesIfNeeded
 $currentUser = $null
 $wslInstalledBySetup = $false
@@ -794,9 +818,10 @@ if ([string]::IsNullOrWhiteSpace($ListenAddress)) {
   $listenConfig = $matchedCandidate
 }
 
-$ListenAddress = $listenConfig.IPAddress
-$ListenInterfaceAlias = $listenConfig.InterfaceAlias
+  $ListenAddress = $listenConfig.IPAddress
+  $ListenInterfaceAlias = $listenConfig.InterfaceAlias
 
+Write-SetupStatus -Step 2 -Message "Selecting the Windows LAN address and preparing local state."
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 
 if ($rebootNeeded) {
@@ -821,14 +846,15 @@ if ($rebootNeeded) {
   }
   Write-JsonFile -Path $statePath -Object $state
 
-  Write-Output "WSL features were enabled. Reboot Windows, then rerun this script to finish installing the distro and starting the relay."
+  Complete-SetupStatus -Message "WSL features were enabled. Reboot Windows, then rerun this script to finish installing the distro and starting the relay."
   return
 }
 
+Write-SetupStatus -Step 3 -Message "Installing or repairing the managed Ubuntu WSL distro."
 $wslInstallResult = Install-WslUbuntuDistro -DistroName $manifest.distroName
 $wslInstalledBySetup = $wslInstallResult.InstalledNow
 if ($wslInstallResult.NeedsReboot) {
-  Write-Output "Ubuntu was staged by WSL. Reboot Windows, then rerun this script to finish bootstrapping the distro."
+  Complete-SetupStatus -Message "Ubuntu was staged by WSL. Reboot Windows, then rerun this script to finish bootstrapping the distro."
   return
 }
 
@@ -836,6 +862,7 @@ try {
   if ($distroAlreadyExists) {
     Write-Output "Existing WSL distro '$($manifest.distroName)' detected. Repairing in place."
   }
+  Write-SetupStatus -Step 4 -Message "Loading Linux user metadata and resolving password setup behavior."
   $setupProfileParams = @{
     DistroName = $manifest.distroName
     Path = $linuxSetupConfigPath
@@ -854,10 +881,14 @@ try {
   if ($setupCredentials.Updated) {
     Write-Output "Updated Linux setup metadata at $linuxSetupConfigPath."
   }
+  if ($setupCredentials.PasswordActionMessage) {
+    Write-Output $setupCredentials.PasswordActionMessage
+  }
   if ($setupCredentials.PromptedForPassword) {
     Write-Output "Captured a Linux password interactively for user '$linuxUser'."
   }
 
+  Write-SetupStatus -Step 5 -Message "Creating or refreshing the Linux user account."
   $setLinuxUserParams = @{
     DistroName = $manifest.distroName
     LinuxUser = $linuxUser
@@ -866,10 +897,12 @@ try {
     $setLinuxUserParams.PasswordSecure = $setupCredentials.PasswordSecure
   }
   Set-LinuxUserConfigured @setLinuxUserParams
+  Write-SetupStatus -Step 6 -Message "Installing OpenSSH and writing Linux-side WSL and SSH configuration."
   Install-OpenSshServerIfMissing -DistroName $manifest.distroName
   Initialize-LinuxBootstrapConfiguration -DistroName $manifest.distroName -LinuxUser $linuxUser -SshPort $manifest.sshPort -SecurityProfile $linuxSecurityProfile
   Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--shutdown") -Description "Apply Linux bootstrap configuration"
 
+  Write-SetupStatus -Step 7 -Message "Disabling conflicting Windows SSH settings and cleaning old relay state."
   $sshdService = Get-Service sshd -ErrorAction SilentlyContinue
   $sshdServiceExists = $null -ne $sshdService
   if ($sshdServiceExists) {
@@ -894,6 +927,7 @@ try {
   }
 
   Remove-PortProxyForPort -ListenPort $manifest.sshPort
+  Write-SetupStatus -Step 8 -Message "Rendering the relay script, writing .wslconfig, and updating the firewall rule."
   New-Item -ItemType Directory -Path $programDataDir -Force | Out-Null
   $relayScript = Get-RelayScriptContent -TemplatePath $relayTypeDefinitionTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $ListenAddress -PreferredInterfaceAlias $ListenInterfaceAlias
   [System.IO.File]::WriteAllText($programDataScriptPath, $relayScript, [System.Text.UTF8Encoding]::new($false))
@@ -904,6 +938,7 @@ try {
   Set-ManagedFirewallRule -Port $manifest.sshPort
   $managedFirewallRuleChanged = $true
 
+  Write-SetupStatus -Step 9 -Message "Registering and starting the Windows relay task."
   $currentUser = Get-CurrentWindowsUser
   $relayAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$programDataScriptPath`""
   $relayBootTrigger = New-ScheduledTaskTrigger -AtStartup
@@ -942,13 +977,14 @@ try {
   }
   Write-JsonFile -Path $statePath -Object $state
 
-  Write-Output "Setup complete."
+  Complete-SetupStatus -Message "Setup complete."
   Write-Output "ListenAddress: $ListenAddress"
   Write-Output "ListenInterfaceAlias: $ListenInterfaceAlias"
   Write-Output "Distro: $($manifest.distroName)"
   Write-Output "SSH: ssh -p $($manifest.sshPort) $linuxUser@$ListenAddress"
 }
 catch {
+  Write-Progress -Activity "Setting up WSL Ubuntu SSH" -Status "Setup failed." -Completed
   try {
     Restore-PartialSetup `
       -RelayTaskCreated $relayTaskCreated `
