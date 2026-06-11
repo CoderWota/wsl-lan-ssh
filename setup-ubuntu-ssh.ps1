@@ -887,7 +887,8 @@ function Remove-PortProxyForPort {
 
 function Get-RelayScriptContent {
   param(
-    [Parameter(Mandatory = $true)][string]$TemplatePath,
+    [Parameter(Mandatory = $true)][string]$TypeDefinitionTemplatePath,
+    [Parameter(Mandatory = $true)][string]$PowerShellScriptTemplatePath,
     [Parameter(Mandatory = $true)][string]$DistroName,
     [Parameter(Mandatory = $true)][int]$Port,
     [Parameter(Mandatory = $true)][int]$IdleShutdownSeconds,
@@ -895,9 +896,14 @@ function Get-RelayScriptContent {
     [Parameter(Mandatory = $true)][string]$PreferredInterfaceAlias
   )
 
-  $typeDefinitionSource = Read-TextFileIfPresent -Path $TemplatePath
+  $typeDefinitionSource = Read-TextFileIfPresent -Path $TypeDefinitionTemplatePath
   if ($null -eq $typeDefinitionSource) {
-    throw "Relay C# type definition template is missing: $TemplatePath"
+    throw "Relay C# type definition template is missing: $TypeDefinitionTemplatePath"
+  }
+
+  $relayScriptSource = Read-TextFileIfPresent -Path $PowerShellScriptTemplatePath
+  if ($null -eq $relayScriptSource) {
+    throw "Relay PowerShell script template is missing: $PowerShellScriptTemplatePath"
   }
 
   $renderedTypeDefinition = ($typeDefinitionSource.Replace("__DISTRO__", $DistroName).
@@ -906,37 +912,6 @@ function Get-RelayScriptContent {
     Replace("__PREFERRED_ADDRESS__", (ConvertTo-TemplateTokenValue -Text $PreferredListenAddress)).
     Replace("__PREFERRED_ALIAS__", (ConvertTo-TemplateTokenValue -Text $PreferredInterfaceAlias)).
     Replace("__LOG_PATH__", (ConvertTo-TemplateTokenValue -Text "C:\ProgramData\WslSshLan\WslSshRelay.log")))
-
-  $relayScriptSource = @'
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-
-function Initialize-Utf8Output {
-  $utf8 = [System.Text.UTF8Encoding]::new($false)
-  try {
-    [Console]::InputEncoding = $utf8
-    [Console]::OutputEncoding = $utf8
-  } catch {
-    Write-Verbose "Console UTF-8 initialization was skipped. $($_.Exception.Message)"
-  }
-  Set-Variable -Scope Script -Name OutputEncoding -Value $utf8
-  if (-not (Get-Variable -Scope Script -Name PSDefaultParameterValues -ErrorAction SilentlyContinue)) {
-    Set-Variable -Scope Script -Name PSDefaultParameterValues -Value @{}
-  }
-  $script:PSDefaultParameterValues["Out-File:Encoding"] = "utf8"
-  $script:PSDefaultParameterValues["Set-Content:Encoding"] = "utf8"
-  $script:PSDefaultParameterValues["Add-Content:Encoding"] = "utf8"
-}
-
-Initialize-Utf8Output
-
-Add-Type -TypeDefinition @"
-__TYPE_DEFINITION__
-"@
-
-$relay = [WslSshRelay]::new("__DISTRO__", __PORT__, __IDLE_TIMEOUT__, "__PREFERRED_ADDRESS__", "__PREFERRED_ALIAS__", "__LOG_PATH__")
-$relay.Run()
-'@
 
   return ($relayScriptSource.Replace("__TYPE_DEFINITION__", $renderedTypeDefinition).
     Replace("__DISTRO__", $DistroName).
@@ -1035,6 +1010,7 @@ $manifest = Read-JsonFile -Path $manifestPath
 $setupDefaultsPath = Join-Path $scriptRoot $manifest.setupDefaultsPath
 $linuxSecurityProfilePath = Join-Path $scriptRoot $manifest.linuxSecurityProfilePath
 $relayTypeDefinitionTemplatePath = Join-Path $scriptRoot $manifest.relayTypeDefinitionTemplatePath
+$relayPowerShellScriptTemplatePath = Join-Path $scriptRoot $manifest.relayPowerShellScriptTemplatePath
 if (-not (Test-Path -LiteralPath $setupDefaultsPath)) {
   throw "Setup defaults file is missing: $setupDefaultsPath"
 }
@@ -1043,6 +1019,9 @@ if (-not (Test-Path -LiteralPath $linuxSecurityProfilePath)) {
 }
 if (-not (Test-Path -LiteralPath $relayTypeDefinitionTemplatePath)) {
   throw "Relay C# type definition template file is missing: $relayTypeDefinitionTemplatePath"
+}
+if (-not (Test-Path -LiteralPath $relayPowerShellScriptTemplatePath)) {
+  throw "Relay PowerShell script template file is missing: $relayPowerShellScriptTemplatePath"
 }
 
 $setupDefaults = Read-JsonFile -Path $setupDefaultsPath
@@ -1136,7 +1115,7 @@ New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 
 if ($rebootNeeded) {
   New-Item -ItemType Directory -Path $programDataDir -Force | Out-Null
-  $relayScript = Get-RelayScriptContent -TemplatePath $relayTypeDefinitionTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $ListenAddress -PreferredInterfaceAlias $ListenInterfaceAlias
+  $relayScript = Get-RelayScriptContent -TypeDefinitionTemplatePath $relayTypeDefinitionTemplatePath -PowerShellScriptTemplatePath $relayPowerShellScriptTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $ListenAddress -PreferredInterfaceAlias $ListenInterfaceAlias
   [System.IO.File]::WriteAllText($programDataScriptPath, $relayScript, [System.Text.UTF8Encoding]::new($false))
   [System.IO.File]::WriteAllLines($wslConfigPath, [string[]](Get-WslConfigContent -MemoryLimit $manifest.wslMemoryLimit -VmIdleTimeoutMs $manifest.vmIdleTimeoutMs), [System.Text.UTF8Encoding]::new($false))
 
@@ -1239,7 +1218,7 @@ try {
   Remove-PortProxyForPort -ListenPort $manifest.sshPort
   Write-SetupStatus -Step 8 -Message "Rendering the relay script, writing .wslconfig, and updating the firewall rule."
   New-Item -ItemType Directory -Path $programDataDir -Force | Out-Null
-  $relayScript = Get-RelayScriptContent -TemplatePath $relayTypeDefinitionTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $ListenAddress -PreferredInterfaceAlias $ListenInterfaceAlias
+  $relayScript = Get-RelayScriptContent -TypeDefinitionTemplatePath $relayTypeDefinitionTemplatePath -PowerShellScriptTemplatePath $relayPowerShellScriptTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $ListenAddress -PreferredInterfaceAlias $ListenInterfaceAlias
   [System.IO.File]::WriteAllText($programDataScriptPath, $relayScript, [System.Text.UTF8Encoding]::new($false))
   $programDataScriptCreated = $true
 

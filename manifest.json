@@ -4,6 +4,7 @@
   "linuxSecurityProfilePath": "linux-security-profile.json",
   "linuxSetupConfigPath": "/var/lib/wslssh-lan/setup.json",
   "relayTypeDefinitionTemplatePath": "templates\\WslSshRelay.TypeDefinition.cs",
+  "relayPowerShellScriptTemplatePath": "templates\\WslSshRelay.ps1",
   "sshPort": 2222,
   "wslMemoryLimit": "12GB",
   "vmIdleTimeoutMs": 15000,
