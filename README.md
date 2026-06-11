@@ -47,6 +47,120 @@ The managed SSH policy is:
 
 Run all commands from an elevated PowerShell window.
 
+### Fast path
+
+If you just want the shortest possible path:
+
+1. Open `Windows PowerShell` as Administrator
+2. Enter this repository directory
+3. Run `.\setup-ubuntu-ssh.ps1`
+4. If setup asks for a Linux password, enter one and confirm it
+5. Wait for setup to print the final SSH command
+6. From another device on the same LAN, connect with `ssh -p 2222 ubuntu@<host-lan-ip>`
+
+Example:
+
+```powershell
+cd C:\path\to\this\repository
+```
+
+If you downloaded the repository as a zip, use the folder where you extracted it. If you cloned it with Git, use the folder created by `git clone`.
+
+### Before you run anything
+
+If you only want the default behavior, you usually do not need to edit any file before running setup.
+
+Most users can leave these values as-is:
+
+- distro name: `Ubuntu`
+- SSH port: `2222`
+- default Linux user: `ubuntu`
+- WSL memory limit: `12GB`
+
+You only need to change values when you have a real reason:
+
+- change `setup-defaults.json` if you want a Linux username other than `ubuntu`
+- change `manifest.json` if you want a different SSH port, WSL memory limit, or idle timeout
+- pass `-ListenAddress` only if you want to bind the relay to one specific LAN IP on the Windows host
+- leave `linux-security-profile.json` alone unless you understand the SSH and WSL policy you are changing
+
+### What to edit before setup
+
+#### 1. Optional: change the default Linux username
+
+Edit `setup-defaults.json`:
+
+```json
+{
+  "defaultLinuxUser": "ubuntu"
+}
+```
+
+#### 2. Optional: change the SSH port or WSL limits
+
+Edit `manifest.json` if you need different runtime settings:
+
+```json
+{
+  "sshPort": 2222,
+  "wslMemoryLimit": "12GB",
+  "vmIdleTimeoutMs": 15000,
+  "relayIdleShutdownSeconds": 300
+}
+```
+
+For most users, the defaults are fine.
+
+### How to find the values on Windows
+
+#### Find your LAN IPv4 address
+
+If you want to use `-ListenAddress`, first find the IPv4 address of the Windows host on your home or office LAN:
+
+```powershell
+ipconfig
+```
+
+Look for the active network adapter you are actually using, then find its `IPv4 Address`.
+
+Example:
+
+```text
+Wireless LAN adapter Wi-Fi:
+   IPv4 Address. . . . . . . . . . . : 192.168.1.23
+```
+
+In that case, you would use:
+
+```powershell
+.\setup-ubuntu-ssh.ps1 -ListenAddress 192.168.1.23
+```
+
+If you are not sure which address to use, do not pass `-ListenAddress`. Setup will try to choose a suitable LAN address automatically.
+
+#### Check whether you are running as Administrator
+
+The setup and uninstall scripts must be run from an elevated PowerShell window.
+
+The easiest way:
+
+1. Open the Start menu
+2. Search for `PowerShell`
+3. Right-click `Windows PowerShell`
+4. Choose `Run as administrator`
+
+If the window title does not mention Administrator, close it and reopen it correctly.
+
+### Pre-flight checklist
+
+Before you run setup, make sure:
+
+- you opened PowerShell as Administrator
+- you are currently in this repository directory
+- your Windows machine is connected to the LAN you want to use
+- no other service on Windows is supposed to own TCP `2222`
+- you already know whether you want to keep the default Linux username `ubuntu`
+
 ### First install
 
 ```powershell
