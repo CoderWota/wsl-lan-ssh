@@ -6,6 +6,25 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+function Initialize-Utf8Output {
+  $utf8 = [System.Text.UTF8Encoding]::new($false)
+  try {
+    [Console]::InputEncoding = $utf8
+    [Console]::OutputEncoding = $utf8
+  } catch {
+    Write-Verbose "Console UTF-8 initialization was skipped. $($_.Exception.Message)"
+  }
+  Set-Variable -Scope Script -Name OutputEncoding -Value $utf8
+  if (-not (Get-Variable -Scope Script -Name PSDefaultParameterValues -ErrorAction SilentlyContinue)) {
+    Set-Variable -Scope Script -Name PSDefaultParameterValues -Value @{}
+  }
+  $script:PSDefaultParameterValues["Out-File:Encoding"] = "utf8"
+  $script:PSDefaultParameterValues["Set-Content:Encoding"] = "utf8"
+  $script:PSDefaultParameterValues["Add-Content:Encoding"] = "utf8"
+}
+
+Initialize-Utf8Output
+
 function Test-IsAdministrator {
   $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
@@ -18,7 +37,7 @@ function Get-CurrentWindowsUser {
 
 function Read-JsonFile {
   param([Parameter(Mandatory = $true)][string]$Path)
-  return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+  return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
 function Write-JsonFile {
@@ -28,17 +47,53 @@ function Write-JsonFile {
   )
 
   $json = $Object | ConvertTo-Json -Depth 8
-  Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+  [System.IO.File]::WriteAllText($Path, $json, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Read-TextFileIfPresent {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return $null
+  }
+
+  return Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+}
+
+function Write-Utf8TextFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+  )
+
+  [System.IO.File]::WriteAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
+}
+
+function ConvertTo-TemplateTokenValue {
+  param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+  return $Text.Replace('"', '""')
+}
+
+function ConvertTo-LinuxSingleQuotedText {
+  param([Parameter(Mandatory = $true)][string]$Text)
+
+  return "'" + ($Text -replace "'", "'""'""'") + "'"
 }
 
 function Invoke-NativeCommand {
   param(
     [Parameter(Mandatory = $true)][string]$FilePath,
     [Parameter(Mandatory = $true)][string[]]$Arguments,
-    [Parameter(Mandatory = $true)][string]$Description
+    [Parameter(Mandatory = $true)][string]$Description,
+    [string]$InputText
   )
 
-  $output = & $FilePath @Arguments 2>&1
+  $output = if ($PSBoundParameters.ContainsKey("InputText")) {
+    $InputText | & $FilePath @Arguments 2>&1
+  } else {
+    & $FilePath @Arguments 2>&1
+  }
   $exitCode = $LASTEXITCODE
   if ($exitCode -ne 0) {
     $message = @($output) -join [Environment]::NewLine
@@ -48,124 +103,272 @@ function Invoke-NativeCommand {
   return $output
 }
 
-function Get-RepositoryOriginUrl {
-  param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
-
-  try {
-    $originUrl = Invoke-NativeCommand -FilePath "git.exe" -Arguments @("-C", $RepositoryRoot, "remote", "get-url", "origin") -Description "Read git origin URL"
-    return ($originUrl | Select-Object -First 1).Trim()
-  } catch {
-    return $null
-  }
-}
-
-function Get-GitHubRepositoryInfo {
-  param([Parameter(Mandatory = $true)][string]$OriginUrl)
-
-  if ($OriginUrl -match "^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$") {
-    return [pscustomobject]@{
-      Owner = $matches[1]
-      Repo = $matches[2]
-    }
-  }
-
-  if ($OriginUrl -match "^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$") {
-    return [pscustomobject]@{
-      Owner = $matches[1]
-      Repo = $matches[2]
-    }
-  }
-
-  return $null
-}
-
-function Resolve-ReleaseAssetUrl {
+function Test-LinuxPathPresent {
   param(
-    [Parameter(Mandatory = $true)][string]$RepositoryRoot,
-    [Parameter(Mandatory = $true)]$Manifest
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$Path
   )
 
-  if ($Manifest.PSObject.Properties.Name -contains "imageDownloadUrl" -and -not [string]::IsNullOrWhiteSpace($Manifest.imageDownloadUrl)) {
-    return $Manifest.imageDownloadUrl
-  }
-
-  $originUrl = Get-RepositoryOriginUrl -RepositoryRoot $RepositoryRoot
-  if ([string]::IsNullOrWhiteSpace($originUrl)) {
-    return $null
-  }
-
-  $repoInfo = Get-GitHubRepositoryInfo -OriginUrl $originUrl
-  if (-not $repoInfo) {
-    return $null
-  }
-
-  $assetName = if (
-    $Manifest.PSObject.Properties.Name -contains "imageReleaseAssetName" -and
-    -not [string]::IsNullOrWhiteSpace($Manifest.imageReleaseAssetName)
-  ) {
-    $Manifest.imageReleaseAssetName
-  } else {
-    Split-Path -Leaf $Manifest.imagePath
-  }
-
-  $releaseApiUrl = if (
-    $Manifest.PSObject.Properties.Name -contains "imageReleaseTag" -and
-    -not [string]::IsNullOrWhiteSpace($Manifest.imageReleaseTag)
-  ) {
-    "https://api.github.com/repos/$($repoInfo.Owner)/$($repoInfo.Repo)/releases/tags/$($Manifest.imageReleaseTag)"
-  } else {
-    "https://api.github.com/repos/$($repoInfo.Owner)/$($repoInfo.Repo)/releases/latest"
-  }
-
   try {
-    $release = Invoke-RestMethod -Uri $releaseApiUrl -Headers @{ "User-Agent" = "Codex-WSL-Setup" }
+    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/bin/test", "-f", $Path) -Description "Check Linux path '$Path'"
+    return $true
   } catch {
-    throw "Could not read the GitHub release metadata from $releaseApiUrl. $($_.Exception.Message)"
+    Write-Verbose "Linux path '$Path' is not present in distro '$DistroName'."
+    return $false
   }
-
-  $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
-  if (-not $asset) {
-    throw "Could not find release asset '$assetName' in the configured GitHub release."
-  }
-
-  return $asset.browser_download_url
 }
 
-function Ensure-ImagePresent {
+function Read-LinuxTextFile {
   param(
-    [Parameter(Mandatory = $true)][string]$ImagePath,
-    [Parameter(Mandatory = $true)][string]$RepositoryRoot,
-    [Parameter(Mandatory = $true)]$Manifest
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$Path
   )
 
-  if (Test-Path -LiteralPath $ImagePath) {
-    return
-  }
+  $content = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/bin/cat", $Path) -Description "Read Linux file '$Path'"
+  return (@($content) -join [Environment]::NewLine)
+}
 
-  $assetUrl = Resolve-ReleaseAssetUrl -RepositoryRoot $RepositoryRoot -Manifest $Manifest
-  if ([string]::IsNullOrWhiteSpace($assetUrl)) {
-    throw "Image not found: $ImagePath. No imageDownloadUrl was configured and no GitHub release asset could be resolved from origin."
-  }
+function Write-LinuxTextFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Text,
+    [string]$DirectoryMode,
+    [string]$FileMode
+  )
 
-  New-Item -ItemType Directory -Path (Split-Path -Parent $ImagePath) -Force | Out-Null
-  $downloadPath = "$ImagePath.download"
-  if (Test-Path -LiteralPath $downloadPath) {
-    Remove-Item -LiteralPath $downloadPath -Force
+  $directory = if ($Path -match '^(.+)/[^/]+$') { $matches[1] } else { "." }
+  $quotedDirectory = ConvertTo-LinuxSingleQuotedText -Text $directory
+  $quotedPath = ConvertTo-LinuxSingleQuotedText -Text $Path
+  $shellCommand = "umask 077; /bin/mkdir -p $quotedDirectory"
+  if ($PSBoundParameters.ContainsKey("DirectoryMode") -and -not [string]::IsNullOrWhiteSpace($DirectoryMode)) {
+    $shellCommand += "; /bin/chmod $DirectoryMode $quotedDirectory"
   }
+  $shellCommand += "; /bin/cat > $quotedPath"
+  if ($PSBoundParameters.ContainsKey("FileMode") -and -not [string]::IsNullOrWhiteSpace($FileMode)) {
+    $shellCommand += "; /bin/chmod $FileMode $quotedPath"
+  }
+  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/bin/sh", "-c", $shellCommand) -InputText $Text -Description "Write Linux file '$Path'"
+}
 
-  Write-Host "Downloading WSL image from $assetUrl"
-  try {
-    Invoke-WebRequest -Uri $assetUrl -OutFile $downloadPath -Headers @{ "User-Agent" = "Codex-WSL-Setup" }
-    Move-Item -LiteralPath $downloadPath -Destination $ImagePath -Force
-  } catch {
-    if (Test-Path -LiteralPath $downloadPath) {
-      Remove-Item -LiteralPath $downloadPath -Force -ErrorAction SilentlyContinue
-    }
-    throw "Failed to download the WSL image from $assetUrl. $($_.Exception.Message)"
+function Get-DefaultSetupProfile {
+  param([Parameter(Mandatory = $true)][string]$DefaultLinuxUser)
+
+  return [ordered]@{
+    linuxUser = $DefaultLinuxUser
+    linuxPassword = "Wsl-" + ([Guid]::NewGuid().ToString("N"))
   }
 }
 
-function Get-TrustedLanCandidates {
+function Read-OrCreate-SetupProfile {
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$DefaultLinuxUser
+  )
+
+  $defaults = Get-DefaultSetupProfile -DefaultLinuxUser $DefaultLinuxUser
+
+  $config = $null
+  if (Test-LinuxPathPresent -DistroName $DistroName -Path $Path) {
+    try {
+      $config = Read-LinuxTextFile -DistroName $DistroName -Path $Path | ConvertFrom-Json
+    } catch {
+      throw "Could not read setup credentials from $Path inside distro '$DistroName'. $($_.Exception.Message)"
+    }
+  }
+
+  $linuxUser = if ($config -and ($config.PSObject.Properties.Name -contains "linuxUser") -and -not [string]::IsNullOrWhiteSpace($config.linuxUser)) {
+    [string]$config.linuxUser
+  } else {
+    $defaults.linuxUser
+  }
+
+  $loginSecretText = if ($config -and ($config.PSObject.Properties.Name -contains "linuxPassword") -and -not [string]::IsNullOrWhiteSpace($config.linuxPassword)) {
+    [string]$config.linuxPassword
+  } else {
+    $defaults.linuxPassword
+  }
+
+  if ($linuxUser -notmatch '^[a-z_][a-z0-9_-]*$') {
+    throw "linuxUser in $Path must match the standard Linux account pattern [a-z_][a-z0-9_-]*."
+  }
+
+  if ($loginSecretText -match "[\r\n:]") {
+    throw "linuxPassword in $Path cannot contain a colon or newline."
+  }
+
+  $normalizedConfig = [ordered]@{
+    linuxUser = $linuxUser
+    linuxPassword = $loginSecretText
+  }
+
+  $shouldWrite = -not $config
+  if ($config) {
+    $shouldWrite = $shouldWrite -or -not ($config.PSObject.Properties.Name -contains "linuxUser") -or -not ($config.PSObject.Properties.Name -contains "linuxPassword")
+    $shouldWrite = $shouldWrite -or ($config.linuxUser -ne $linuxUser) -or ($config.linuxPassword -ne $loginSecretText)
+  }
+
+  if ($shouldWrite) {
+    $json = $normalizedConfig | ConvertTo-Json -Depth 8 -Compress
+    Write-LinuxTextFile -DistroName $DistroName -Path $Path -Text $json -DirectoryMode "700" -FileMode "600"
+  }
+
+  return [pscustomobject]@{
+    Path = $Path
+    LinuxUser = $linuxUser
+    LinuxPassword = $loginSecretText
+    Created = -not $config
+    Updated = $shouldWrite -and $config
+  }
+}
+
+function Convert-PlainTextToSecureString {
+  param([Parameter(Mandatory = $true)][string]$Text)
+
+  $secure = [System.Security.SecureString]::new()
+  foreach ($character in $Text.ToCharArray()) {
+    $secure.AppendChar($character)
+  }
+
+  $secure.MakeReadOnly()
+  return $secure
+}
+
+function Convert-SecureStringToPlainText {
+  param([Parameter(Mandatory = $true)][securestring]$SecureString)
+
+  $bstr = [System.IntPtr]::Zero
+  try {
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+  } finally {
+    if ($bstr -ne [System.IntPtr]::Zero) {
+      [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+  }
+}
+
+function Test-LinuxUserPresent {
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$LinuxUser
+  )
+
+  try {
+    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/id", "-u", $LinuxUser) -Description "Check Linux user '$LinuxUser'"
+    return $true
+  } catch {
+    Write-Verbose "Linux user '$LinuxUser' is not present in distro '$DistroName'."
+    return $false
+  }
+}
+
+function Set-LinuxUserConfigured {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$LinuxUser,
+    [Parameter(Mandatory = $true)][securestring]$PasswordSecure
+  )
+
+  if ($PSCmdlet.ShouldProcess($LinuxUser, "Configure Linux user in $DistroName")) {
+    $plainPassword = Convert-SecureStringToPlainText -SecureString $PasswordSecure
+    if (-not (Test-LinuxUserPresent -DistroName $DistroName -LinuxUser $LinuxUser)) {
+      Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/sbin/useradd", "--create-home", "--shell", "/bin/bash", "--groups", "sudo", $LinuxUser) -Description "Create Linux user '$LinuxUser'"
+    } else {
+      Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/sbin/usermod", "--shell", "/bin/bash", "--append", "--groups", "sudo", $LinuxUser) -Description "Refresh Linux user '$LinuxUser'"
+    }
+
+    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/sbin/chpasswd") -InputText ("{0}:{1}" -f $LinuxUser, $plainPassword) -Description "Set password for Linux user '$LinuxUser'"
+  }
+}
+
+function Get-LinuxWslConfigContent {
+  param(
+    [Parameter(Mandatory = $true)][string]$DefaultLinuxUser,
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$TemplateLines
+  )
+
+  return $TemplateLines | ForEach-Object {
+    $_.Replace("__DEFAULT_LINUX_USER__", $DefaultLinuxUser)
+  }
+}
+
+function Get-LinuxSshdConfigContent {
+  param(
+    [Parameter(Mandatory = $true)][int]$Port,
+    [Parameter(Mandatory = $true)][string]$LinuxUser,
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$TemplateLines
+  )
+
+  return $TemplateLines | ForEach-Object {
+    $_.
+      Replace("__SSH_PORT__", $Port.ToString()).
+      Replace("__DEFAULT_LINUX_USER__", $LinuxUser)
+  }
+}
+
+function Install-WslUbuntuDistro {
+  param([Parameter(Mandatory = $true)][string]$DistroName)
+
+  if (Test-DistroPresent -DistroName $DistroName) {
+    try {
+      Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--exec", "/bin/true") -Description "Probe WSL distro '$DistroName'"
+      return [pscustomobject]@{
+        InstalledNow = $false
+        NeedsReboot = $false
+      }
+    } catch {
+      $probeMessage = $_.Exception.Message
+      if ($probeMessage -match "ERROR_PATH_NOT_FOUND|ext4\.vhdx|path\s+not\s+found|MountDisk") {
+        Write-Output "Existing WSL distro '$DistroName' is registered but its disk is missing. Reinstalling it."
+        Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--unregister", $DistroName) -Description "Unregister stale WSL distro '$DistroName'"
+      } else {
+        throw "Existing WSL distro '$DistroName' is registered but not usable. $probeMessage"
+      }
+    }
+  }
+
+  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--install", "-d", $DistroName, "--web-download", "--no-launch") -Description "Install WSL distro '$DistroName'" | Out-Null
+
+  return [pscustomobject]@{
+    InstalledNow = $true
+    NeedsReboot = -not (Test-DistroPresent -DistroName $DistroName)
+  }
+}
+
+function Install-OpenSshServerIfMissing {
+  param([Parameter(Mandatory = $true)][string]$DistroName)
+
+  try {
+    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/dpkg", "-s", "openssh-server") -Description "Check OpenSSH server package"
+    return $false
+  } catch {
+    Write-Verbose "OpenSSH server package is not installed in distro '$DistroName'. Installing it now."
+  }
+
+  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/apt-get", "update") -Description "Update Linux package lists"
+  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "/usr/bin/apt-get", "install", "-y", "openssh-server") -Description "Install OpenSSH server"
+  return $true
+}
+
+function Initialize-LinuxBootstrapConfiguration {
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$LinuxUser,
+    [Parameter(Mandatory = $true)][int]$SshPort,
+    [Parameter(Mandatory = $true)]$SecurityProfile
+  )
+
+  $wslConfigText = [string]::Join([Environment]::NewLine, (Get-LinuxWslConfigContent -DefaultLinuxUser $LinuxUser -TemplateLines ([string[]]$SecurityProfile.wslConfTemplateLines)))
+  Write-LinuxTextFile -DistroName $DistroName -Path "/etc/wsl.conf" -Text $wslConfigText -FileMode "644"
+
+  $sshConfigText = [string]::Join([Environment]::NewLine, (Get-LinuxSshdConfigContent -Port $SshPort -LinuxUser $LinuxUser -TemplateLines ([string[]]$SecurityProfile.sshdTemplateLines)))
+  Write-LinuxTextFile -DistroName $DistroName -Path "/etc/ssh/sshd_config.d/99-wsl-ssh-lan.conf" -Text $sshConfigText -FileMode "644"
+}
+
+function Get-TrustedLanCandidate {
   return Get-NetIPConfiguration |
     Where-Object {
       $_.IPv4DefaultGateway -and
@@ -176,6 +379,7 @@ function Get-TrustedLanCandidates {
     ForEach-Object {
       [pscustomobject]@{
         InterfaceAlias = $_.InterfaceAlias
+        InterfaceIndex = $_.InterfaceIndex
         IPAddress = $_.IPv4Address.IPAddress
       }
     }
@@ -207,10 +411,15 @@ function Enable-WslFeaturesIfNeeded {
   return $changes
 }
 
-function Test-DistroExists {
+function Test-DistroPresent {
   param([Parameter(Mandatory = $true)][string]$DistroName)
 
-  $distros = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-l", "-q") -Description "List WSL distributions"
+  try {
+    $distros = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-l", "-q") -Description "List WSL distributions"
+  } catch {
+    Write-Verbose "WSL distribution list is unavailable."
+    return $false
+  }
   if (-not $distros) {
     return $false
   }
@@ -218,250 +427,137 @@ function Test-DistroExists {
   return [bool]($distros | Where-Object { $_.Trim() -eq $DistroName } | Select-Object -First 1)
 }
 
-function Test-TaskExists {
+function Test-TaskPresent {
   param([Parameter(Mandatory = $true)][string]$TaskName)
   return [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
 }
 
 function Get-WslConfigContent {
+  param(
+    [Parameter(Mandatory = $true)][string]$MemoryLimit,
+    [Parameter(Mandatory = $true)][int]$VmIdleTimeoutMs
+  )
+
   return @(
     "[wsl2]",
+    "memory=$MemoryLimit",
     "networkingMode=nat",
     "firewall=true",
-    "vmIdleTimeout=86400000"
+    "vmIdleTimeout=$VmIdleTimeoutMs",
+    "",
+    "[experimental]",
+    "autoMemoryReclaim=dropCache"
   )
 }
 
+function Get-FirewallRuleDisplayName {
+  param([Parameter(Mandatory = $true)][int]$Port)
+
+  return "WSL SSH LAN $Port"
+}
+
+function Set-ManagedFirewallRule {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param([Parameter(Mandatory = $true)][int]$Port)
+
+  $displayName = Get-FirewallRuleDisplayName -Port $Port
+  Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+
+  if ($PSCmdlet.ShouldProcess($displayName, "Create Windows Firewall inbound allow rule")) {
+    New-NetFirewallRule `
+      -DisplayName $displayName `
+      -Direction Inbound `
+      -Action Allow `
+      -Profile Domain,Private `
+      -Protocol TCP `
+      -LocalPort $Port `
+      -RemoteAddress LocalSubnet | Out-Null
+  }
+}
+
 function Remove-PortProxyForPort {
+  [CmdletBinding(SupportsShouldProcess = $true)]
   param([Parameter(Mandatory = $true)][int]$ListenPort)
 
   $rows = Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "show", "v4tov4") -Description "List portproxy entries"
   foreach ($row in $rows) {
     if ($row -match "^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+($ListenPort)\s+\d{1,3}(?:\.\d{1,3}){3}\s+\d+\s*$") {
-      Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "delete", "v4tov4", "listenaddress=$($matches[1])", "listenport=$ListenPort") -Description "Delete portproxy $($matches[1])`:$ListenPort"
-    }
-  }
-}
-
-function Get-RefreshScriptContent {
-  param(
-    [Parameter(Mandatory = $true)][string]$DistroName,
-    [Parameter(Mandatory = $true)][int]$Port,
-    [Parameter(Mandatory = $true)][string]$ExpectedListenAddress,
-    [Parameter(Mandatory = $true)][string]$ExpectedInterfaceAlias
-  )
-
-@"
-`$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-
-function Invoke-NativeCommand {
-  param(
-    [Parameter(Mandatory = `$true)][string]`$FilePath,
-    [Parameter(Mandatory = `$true)][string[]]`$Arguments,
-    [Parameter(Mandatory = `$true)][string]`$Description
-  )
-
-  `$output = & `$FilePath @Arguments 2>&1
-  `$exitCode = `$LASTEXITCODE
-  if (`$exitCode -ne 0) {
-    `$message = @(`$output) -join [Environment]::NewLine
-    throw "`$Description failed with exit code `$exitCode. `$message"
-  }
-
-  return `$output
-}
-
-`$Distro = "$DistroName"
-`$Port = $Port
-`$ExpectedListenAddress = "$ExpectedListenAddress"
-`$ExpectedInterfaceAlias = "$ExpectedInterfaceAlias"
-`$LogPath = "C:\ProgramData\WslSshLan\Update-WslSshLan.log"
-`$AllowRuleName = "WSL SSH LAN 2222"
-`$LegacyBlockRuleName = "WSL SSH Block Non-LAN 2222"
-`$LegacyPublicBlockRuleName = "WSL SSH Block Public 2222"
-
-function Write-Log {
-  param([Parameter(Mandatory = `$true)][string]`$Message)
-
-  `$line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `$Message
-  Add-Content -LiteralPath `$LogPath -Value `$line
-  Write-Host `$Message
-}
-
-function Get-PortProxyForPort {
-  param(
-    [Parameter(Mandatory = `$true)][string]`$ListenAddress,
-    [Parameter(Mandatory = `$true)][int]`$ListenPort
-  )
-
-  `$escapedListenAddress = [regex]::Escape(`$ListenAddress)
-  `$rows = Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "show", "v4tov4") -Description "List portproxy entries"
-  foreach (`$row in `$rows) {
-    if (`$row -match "^\s*(`$escapedListenAddress)\s+(`$ListenPort)\s+(\d{1,3}(?:\.\d{1,3}){3})\s+(\d+)\s*$") {
-      return [pscustomobject]@{
-        ListenAddress = `$matches[1]
-        ListenPort = [int]`$matches[2]
-        ConnectAddress = `$matches[3]
-        ConnectPort = [int]`$matches[4]
+      if ($PSCmdlet.ShouldProcess("$($matches[1]):$ListenPort", "Delete portproxy")) {
+        Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "delete", "v4tov4", "listenaddress=$($matches[1])", "listenport=$ListenPort") -Description "Delete portproxy $($matches[1])`:$ListenPort"
       }
     }
   }
-
-  return `$null
 }
 
-function Remove-PortProxyForPort {
+function Get-RelayScriptContent {
   param(
-    [Parameter(Mandatory = `$true)][string]`$ListenAddress,
-    [Parameter(Mandatory = `$true)][int]`$ListenPort
+    [Parameter(Mandatory = $true)][string]$TemplatePath,
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][int]$Port,
+    [Parameter(Mandatory = $true)][int]$IdleShutdownSeconds,
+    [Parameter(Mandatory = $true)][string]$PreferredListenAddress,
+    [Parameter(Mandatory = $true)][string]$PreferredInterfaceAlias
   )
 
-  `$escapedListenAddress = [regex]::Escape(`$ListenAddress)
-  `$rows = Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "show", "v4tov4") -Description "List portproxy entries"
-  foreach (`$row in `$rows) {
-    if (`$row -match "^\s*(`$escapedListenAddress)\s+(`$ListenPort)\s+\d{1,3}(?:\.\d{1,3}){3}\s+\d+\s*$") {
-      Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "delete", "v4tov4", "listenaddress=`$ListenAddress", "listenport=`$ListenPort") -Description "Delete portproxy `${ListenAddress}:`$ListenPort"
-    }
-  }
-}
-
-function Get-TrustedLanConfig {
-  `$candidates = @(Get-NetIPConfiguration |
-    Where-Object {
-      `$_.IPv4DefaultGateway -and
-      `$_.NetAdapter.Status -eq "Up" -and
-      `$_.IPv4Address.IPAddress -notlike "169.254.*" -and
-      (`$_.NetProfile.NetworkCategory -eq "Private" -or `$_.NetProfile.NetworkCategory -eq "DomainAuthenticated")
-    })
-
-  if (`$ExpectedInterfaceAlias) {
-    `$matchedAlias = `$candidates | Where-Object { `$_.InterfaceAlias -eq `$ExpectedInterfaceAlias } | Sort-Object -Property InterfaceIndex | Select-Object -First 1
-    if (`$matchedAlias) {
-      return `$matchedAlias
-    }
+  $typeDefinitionSource = Read-TextFileIfPresent -Path $TemplatePath
+  if ($null -eq $typeDefinitionSource) {
+    throw "Relay C# type definition template is missing: $TemplatePath"
   }
 
-  if (`$ExpectedListenAddress) {
-    `$matchedAddress = `$candidates | Where-Object { `$_.IPv4Address.IPAddress -eq `$ExpectedListenAddress } | Sort-Object -Property InterfaceIndex | Select-Object -First 1
-    if (`$matchedAddress) {
-      return `$matchedAddress
-    }
-  }
+  $renderedTypeDefinition = ($typeDefinitionSource.Replace("__DISTRO__", $DistroName).
+    Replace("__PORT__", $Port.ToString()).
+    Replace("__IDLE_TIMEOUT__", $IdleShutdownSeconds.ToString()).
+    Replace("__PREFERRED_ADDRESS__", (ConvertTo-TemplateTokenValue -Text $PreferredListenAddress)).
+    Replace("__PREFERRED_ALIAS__", (ConvertTo-TemplateTokenValue -Text $PreferredInterfaceAlias)).
+    Replace("__LOG_PATH__", (ConvertTo-TemplateTokenValue -Text "C:\ProgramData\WslSshLan\WslSshRelay.log")))
 
-  if (`$candidates.Count -eq 1) {
-    return `$candidates[0]
-  }
+  $relayScriptSource = @'
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
-  return `$null
-}
-
-New-Item -ItemType Directory -Path (Split-Path -Parent `$LogPath) -Force | Out-Null
-
-`$lanConfig = `$null
-for (`$attempt = 1; `$attempt -le 60; `$attempt++) {
-  `$lanConfig = Get-TrustedLanConfig
-  if (`$lanConfig) {
-    break
-  }
-
-  Start-Sleep -Seconds 5
-}
-
-if (-not `$lanConfig) {
-  throw "Could not find a trusted LAN interface matching `$ExpectedInterfaceAlias or `$ExpectedListenAddress."
-}
-
-`$listenAddress = `$lanConfig.IPv4Address.IPAddress
-
-`$wslAddress = `$null
-`$listenCheck = `$null
-for (`$attempt = 1; `$attempt -le 60; `$attempt++) {
+function Initialize-Utf8Output {
+  $utf8 = [System.Text.UTF8Encoding]::new($false)
   try {
-    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "-u", "root", "--", "sh", "-lc", "systemctl disable --now ssh.socket >/dev/null 2>&1 || true; systemctl enable --now ssh.service >/dev/null 2>&1 || service ssh start >/dev/null 2>&1 || true") -Description "Prepare WSL ssh service"
-    `$wslAddress = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "--", "sh", "-lc", "hostname -I | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1") -Description "Read WSL IPv4 address"
-    if (`$wslAddress) {
-      `$listenCheck = Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("-d", `$Distro, "--", "sh", "-lc", "ss -ltnH '( sport = :`$Port )' 2>/dev/null | head -n 1") -Description "Verify WSL sshd listener"
-    }
+    [Console]::InputEncoding = $utf8
+    [Console]::OutputEncoding = $utf8
   } catch {
-    `$wslAddress = `$null
-    `$listenCheck = `$null
+    Write-Verbose "Console UTF-8 initialization was skipped. $($_.Exception.Message)"
   }
-
-  if (`$wslAddress -and `$listenCheck) {
-    break
+  Set-Variable -Scope Script -Name OutputEncoding -Value $utf8
+  if (-not (Get-Variable -Scope Script -Name PSDefaultParameterValues -ErrorAction SilentlyContinue)) {
+    Set-Variable -Scope Script -Name PSDefaultParameterValues -Value @{}
   }
-
-  Start-Sleep -Seconds 5
+  $script:PSDefaultParameterValues["Out-File:Encoding"] = "utf8"
+  $script:PSDefaultParameterValues["Set-Content:Encoding"] = "utf8"
+  $script:PSDefaultParameterValues["Add-Content:Encoding"] = "utf8"
 }
 
-if (-not `$wslAddress) {
-  throw "Could not determine WSL IPv4 address."
-}
+Initialize-Utf8Output
 
-if (-not `$listenCheck) {
-  throw "WSL sshd is not listening on port `$Port."
-}
-
-Remove-NetFirewallRule -DisplayName `$LegacyBlockRuleName -ErrorAction SilentlyContinue
-Remove-NetFirewallRule -DisplayName `$LegacyPublicBlockRuleName -ErrorAction SilentlyContinue
-
-`$portProxy = Get-PortProxyForPort -ListenAddress `$listenAddress -ListenPort `$Port
-if (
-  -not `$portProxy -or
-  `$portProxy.ConnectAddress -ne `$wslAddress -or
-  `$portProxy.ConnectPort -ne `$Port
-) {
-  Remove-PortProxyForPort -ListenAddress `$listenAddress -ListenPort `$Port
-  Invoke-NativeCommand -FilePath "netsh.exe" -Arguments @("interface", "portproxy", "add", "v4tov4", "listenaddress=`$listenAddress", "listenport=`$Port", "connectaddress=`$wslAddress", "connectport=`$Port") -Description "Add portproxy `${listenAddress}:`$Port"
-}
-
-`$existingRule = Get-NetFirewallRule -DisplayName `$AllowRuleName -ErrorAction SilentlyContinue | Select-Object -First 1
-`$ruleNeedsReplace = `$false
-
-if (-not `$existingRule) {
-  `$ruleNeedsReplace = `$true
-} else {
-  `$addressFilter = `$existingRule | Get-NetFirewallAddressFilter
-  `$portFilter = `$existingRule | Get-NetFirewallPortFilter
-  if (
-    `$existingRule.Enabled -ne "True" -or
-    `$existingRule.Direction -ne "Inbound" -or
-    `$existingRule.Action -ne "Allow" -or
-    `$existingRule.Profile -ne 3 -or
-    `$addressFilter.LocalAddress -ne `$listenAddress -or
-    `$addressFilter.RemoteAddress -ne "LocalSubnet" -or
-    `$portFilter.Protocol -ne "TCP" -or
-    `$portFilter.LocalPort -ne `$Port
-  ) {
-    `$ruleNeedsReplace = `$true
-  }
-}
-
-if (`$ruleNeedsReplace) {
-  Remove-NetFirewallRule -DisplayName `$AllowRuleName -ErrorAction SilentlyContinue
-  New-NetFirewallRule `
-    -DisplayName `$AllowRuleName `
-    -Direction Inbound `
-    -Action Allow `
-    -Protocol TCP `
-    -LocalAddress `$listenAddress `
-    -LocalPort `$Port `
-    -RemoteAddress LocalSubnet `
-    -Profile Domain,Private | Out-Null
-}
-
-Write-Log "NAT WSL SSH ready on `${listenAddress}:`$Port -> `${wslAddress}:`$Port."
+Add-Type -TypeDefinition @"
+__TYPE_DEFINITION__
 "@
+
+$relay = [WslSshRelay]::new("__DISTRO__", __PORT__, __IDLE_TIMEOUT__, "__PREFERRED_ADDRESS__", "__PREFERRED_ALIAS__", "__LOG_PATH__")
+$relay.Run()
+'@
+
+  return ($relayScriptSource.Replace("__TYPE_DEFINITION__", $renderedTypeDefinition).
+    Replace("__DISTRO__", $DistroName).
+    Replace("__PORT__", $Port.ToString()).
+    Replace("__IDLE_TIMEOUT__", $IdleShutdownSeconds.ToString()).
+    Replace("__PREFERRED_ADDRESS__", (ConvertTo-TemplateTokenValue -Text $PreferredListenAddress)).
+    Replace("__PREFERRED_ALIAS__", (ConvertTo-TemplateTokenValue -Text $PreferredInterfaceAlias)).
+    Replace("__LOG_PATH__", (ConvertTo-TemplateTokenValue -Text "C:\ProgramData\WslSshLan\WslSshRelay.log")))
 }
 
 function Restore-PartialSetup {
   param(
-    [Parameter(Mandatory = $true)][bool]$RefreshTaskCreated,
-    [Parameter(Mandatory = $true)][bool]$KeepAliveTaskCreated,
+    [Parameter(Mandatory = $true)][bool]$RelayTaskCreated,
     [Parameter(Mandatory = $true)][bool]$ProgramDataScriptCreated,
     [Parameter(Mandatory = $true)][bool]$WslConfigCreated,
-    [Parameter(Mandatory = $true)][bool]$WslImported,
+    [Parameter(Mandatory = $true)][bool]$ManagedFirewallRuleChanged,
+    [Parameter(Mandatory = $true)][bool]$WslInstalledBySetup,
     [Parameter(Mandatory = $true)][bool]$SshdStateChanged,
     [Parameter(Mandatory = $true)][bool]$FirewallRulesChanged,
     [Parameter(Mandatory = $true)][bool]$SshdServiceExists,
@@ -472,36 +568,36 @@ function Restore-PartialSetup {
     [Parameter(Mandatory = $true)][string]$DistroName,
     [Parameter(Mandatory = $true)][string]$ProgramDataScriptPath,
     [Parameter(Mandatory = $true)][string]$WslConfigPath,
-    [Parameter(Mandatory = $true)][string]$InstallPath,
-    [Parameter(Mandatory = $true)][string]$RefreshTaskName,
-    [Parameter(Mandatory = $true)][string]$KeepAliveTaskName
+    [Parameter(Mandatory = $true)][bool]$WslConfigHadExistingFile,
+    [AllowNull()][string]$WslConfigBackupContent,
+    [Parameter(Mandatory = $true)][int]$SshPort,
+    [Parameter(Mandatory = $true)][string]$RelayTaskName
   )
 
-  if ($RefreshTaskCreated -and (Get-ScheduledTask -TaskName $RefreshTaskName -ErrorAction SilentlyContinue)) {
-    Stop-ScheduledTask -TaskName $RefreshTaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $RefreshTaskName -Confirm:$false -ErrorAction SilentlyContinue
-  }
-
-  if ($KeepAliveTaskCreated -and (Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue)) {
-    Stop-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $KeepAliveTaskName -Confirm:$false -ErrorAction SilentlyContinue
+  if ($RelayTaskCreated -and (Get-ScheduledTask -TaskName $RelayTaskName -ErrorAction SilentlyContinue)) {
+    Stop-ScheduledTask -TaskName $RelayTaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $RelayTaskName -Confirm:$false -ErrorAction SilentlyContinue
   }
 
   if ($ProgramDataScriptCreated -and (Test-Path -LiteralPath $ProgramDataScriptPath)) {
     Remove-Item -LiteralPath $ProgramDataScriptPath -Force -ErrorAction SilentlyContinue
   }
 
-  if ($WslConfigCreated -and (Test-Path -LiteralPath $WslConfigPath)) {
-    Remove-Item -LiteralPath $WslConfigPath -Force -ErrorAction SilentlyContinue
+  if ($WslConfigCreated) {
+    if ($WslConfigHadExistingFile) {
+      Write-Utf8TextFile -Path $WslConfigPath -Text $WslConfigBackupContent
+    } elseif (Test-Path -LiteralPath $WslConfigPath) {
+      Remove-Item -LiteralPath $WslConfigPath -Force -ErrorAction SilentlyContinue
+    }
   }
 
-  if ($WslImported -and (Test-DistroExists -DistroName $DistroName)) {
-    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--terminate", $DistroName) -Description "Terminate imported distro"
-    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--unregister", $DistroName) -Description "Unregister imported distro"
+  if ($WslInstalledBySetup -and (Test-DistroPresent -DistroName $DistroName)) {
+    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--terminate", $DistroName) -Description "Terminate WSL distro"
+    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--unregister", $DistroName) -Description "Unregister WSL distro"
   }
 
-  if (Test-Path -LiteralPath $InstallPath) {
-    Remove-Item -LiteralPath $InstallPath -Recurse -Force -ErrorAction SilentlyContinue
+  if ($ManagedFirewallRuleChanged) {
+    Get-NetFirewallRule -DisplayName (Get-FirewallRuleDisplayName -Port $SshPort) -ErrorAction SilentlyContinue | Remove-NetFirewallRule
   }
 
   if ($SshdStateChanged -and $SshdServiceExists) {
@@ -540,27 +636,49 @@ if (-not (Test-IsAdministrator)) {
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $manifestPath = Join-Path $scriptRoot "manifest.json"
 $manifest = Read-JsonFile -Path $manifestPath
+$setupDefaultsPath = Join-Path $scriptRoot $manifest.setupDefaultsPath
+$linuxSecurityProfilePath = Join-Path $scriptRoot $manifest.linuxSecurityProfilePath
+$relayTypeDefinitionTemplatePath = Join-Path $scriptRoot $manifest.relayTypeDefinitionTemplatePath
+if (-not (Test-Path -LiteralPath $setupDefaultsPath)) {
+  throw "Setup defaults file is missing: $setupDefaultsPath"
+}
+if (-not (Test-Path -LiteralPath $linuxSecurityProfilePath)) {
+  throw "Linux security profile file is missing: $linuxSecurityProfilePath"
+}
+if (-not (Test-Path -LiteralPath $relayTypeDefinitionTemplatePath)) {
+  throw "Relay C# type definition template file is missing: $relayTypeDefinitionTemplatePath"
+}
 
-$imagePath = Join-Path $scriptRoot $manifest.imagePath
-$installPath = Join-Path $scriptRoot $manifest.installPath
+$setupDefaults = Read-JsonFile -Path $setupDefaultsPath
+$linuxSecurityProfile = Read-JsonFile -Path $linuxSecurityProfilePath
+if (-not ($setupDefaults.PSObject.Properties.Name -contains "defaultLinuxUser") -or [string]::IsNullOrWhiteSpace($setupDefaults.defaultLinuxUser)) {
+  throw "Setup defaults file is missing 'defaultLinuxUser'."
+}
+if (-not ($linuxSecurityProfile.PSObject.Properties.Name -contains "wslConfTemplateLines") -or -not $linuxSecurityProfile.wslConfTemplateLines) {
+  throw "Linux security profile is missing 'wslConfTemplateLines'."
+}
+if (-not ($linuxSecurityProfile.PSObject.Properties.Name -contains "sshdTemplateLines") -or -not $linuxSecurityProfile.sshdTemplateLines) {
+  throw "Linux security profile is missing 'sshdTemplateLines'."
+}
+$defaultLinuxUser = [string]$setupDefaults.defaultLinuxUser
+
 $stateDir = Join-Path $scriptRoot "state"
 $statePath = Join-Path $stateDir "setup-state.json"
 $programDataDir = Split-Path -Parent $manifest.programDataScriptPath
 $programDataScriptPath = $manifest.programDataScriptPath
+$linuxSetupConfigPath = $manifest.linuxSetupConfigPath
+$legacyProgramDataScriptPath = Join-Path $programDataDir "Update-WslSshLan.ps1"
 $wslConfigPath = Join-Path $env:USERPROFILE ".wslconfig"
+$wslConfigHadExistingFile = Test-Path -LiteralPath $wslConfigPath
+$wslConfigBackupContent = Read-TextFileIfPresent -Path $wslConfigPath
 
 $rebootNeeded = Enable-WslFeaturesIfNeeded
-if ($rebootNeeded) {
-  Write-Host "WSL or VirtualMachinePlatform was enabled. Reboot Windows, then rerun this script."
-  exit 0
-}
-
 $currentUser = $null
-$wslImported = $false
+$wslInstalledBySetup = $false
 $wslConfigCreated = $false
+$managedFirewallRuleChanged = $false
 $programDataScriptCreated = $false
-$refreshTaskCreated = $false
-$keepAliveTaskCreated = $false
+$relayTaskCreated = $false
 $sshdStateChanged = $false
 $firewallRulesChanged = $false
 $sshdServiceExists = $false
@@ -568,35 +686,45 @@ $sshdStartupType = $null
 $sshdWasRunning = $false
 $previewRuleEnabled = $null
 $stableRuleEnabled = $null
-$distroAlreadyExists = Test-DistroExists -DistroName $manifest.distroName
+$distroAlreadyExists = $false
 
-if (Test-Path -LiteralPath $wslConfigPath) {
-  Remove-Item -LiteralPath $wslConfigPath -Force
+if (-not $rebootNeeded) {
+  if (Test-DistroPresent -DistroName $manifest.distroName) {
+    try {
+      Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $manifest.distroName, "--exec", "/bin/true") -Description "Probe WSL distro '$($manifest.distroName)'"
+      $distroAlreadyExists = $true
+    } catch {
+      Write-Verbose "Registered WSL distro '$($manifest.distroName)' is not currently usable."
+      $distroAlreadyExists = $false
+    }
+  }
 }
 
-if (Test-TaskExists -TaskName $manifest.refreshTaskName) {
-  Stop-ScheduledTask -TaskName $manifest.refreshTaskName -ErrorAction SilentlyContinue
-  Unregister-ScheduledTask -TaskName $manifest.refreshTaskName -Confirm:$false
-}
-
-if (Test-TaskExists -TaskName $manifest.keepAliveTaskName) {
-  Stop-ScheduledTask -TaskName $manifest.keepAliveTaskName -ErrorAction SilentlyContinue
-  Unregister-ScheduledTask -TaskName $manifest.keepAliveTaskName -Confirm:$false
+if (Test-TaskPresent -TaskName $manifest.relayTaskName) {
+  Stop-ScheduledTask -TaskName $manifest.relayTaskName -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName $manifest.relayTaskName -Confirm:$false
 }
 
 if (Test-Path -LiteralPath $programDataScriptPath) {
   Remove-Item -LiteralPath $programDataScriptPath -Force
 }
 
+if ($legacyProgramDataScriptPath -ne $programDataScriptPath -and (Test-Path -LiteralPath $legacyProgramDataScriptPath)) {
+  Remove-Item -LiteralPath $legacyProgramDataScriptPath -Force
+}
+
 if ([string]::IsNullOrWhiteSpace($ListenAddress)) {
-  $candidates = @(Get-TrustedLanCandidates)
-  if ($candidates.Count -ne 1) {
-    $details = $candidates | ForEach-Object { "$($_.InterfaceAlias): $($_.IPAddress)" }
-    throw "Could not auto-select a unique trusted LAN IPv4. Rerun with -ListenAddress. Candidates: $($details -join '; ')"
+  $candidates = @(Get-TrustedLanCandidate)
+  if ($candidates.Count -lt 1) {
+    throw "Could not auto-select a trusted LAN IPv4. Rerun with -ListenAddress."
   }
-  $listenConfig = $candidates[0]
+  if ($candidates.Count -gt 1) {
+    $details = $candidates | ForEach-Object { "$($_.InterfaceAlias): $($_.IPAddress)" }
+    Write-Output "Multiple trusted LAN IPv4s detected. Using the first one as the preferred address: $($details -join '; ')"
+  }
+  $listenConfig = $candidates | Sort-Object -Property InterfaceIndex | Select-Object -First 1
 } else {
-  $matchedCandidate = Get-TrustedLanCandidates | Where-Object { $_.IPAddress -eq $ListenAddress } | Select-Object -First 1
+  $matchedCandidate = Get-TrustedLanCandidate | Where-Object { $_.IPAddress -eq $ListenAddress } | Select-Object -First 1
   if (-not $matchedCandidate) {
     throw "ListenAddress '$ListenAddress' is not an active trusted LAN IPv4 on this machine."
   }
@@ -606,25 +734,62 @@ if ([string]::IsNullOrWhiteSpace($ListenAddress)) {
 $ListenAddress = $listenConfig.IPAddress
 $ListenInterfaceAlias = $listenConfig.InterfaceAlias
 
-New-Item -ItemType Directory -Path (Split-Path -Parent $imagePath) -Force | Out-Null
-New-Item -ItemType Directory -Path (Split-Path -Parent $installPath) -Force | Out-Null
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 
-if (-not $distroAlreadyExists) {
-  Ensure-ImagePresent -ImagePath $imagePath -RepositoryRoot $scriptRoot -Manifest $manifest
+if ($rebootNeeded) {
+  New-Item -ItemType Directory -Path $programDataDir -Force | Out-Null
+  $relayScript = Get-RelayScriptContent -TemplatePath $relayTypeDefinitionTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $ListenAddress -PreferredInterfaceAlias $ListenInterfaceAlias
+  [System.IO.File]::WriteAllText($programDataScriptPath, $relayScript, [System.Text.UTF8Encoding]::new($false))
+  [System.IO.File]::WriteAllLines($wslConfigPath, [string[]](Get-WslConfigContent -MemoryLimit $manifest.wslMemoryLimit -VmIdleTimeoutMs $manifest.vmIdleTimeoutMs), [System.Text.UTF8Encoding]::new($false))
+
+  $state = [ordered]@{
+    listenAddress = $ListenAddress
+    listenInterfaceAlias = $ListenInterfaceAlias
+    distroName = $manifest.distroName
+    relayTaskName = $manifest.relayTaskName
+    programDataScriptPath = $programDataScriptPath
+    programDataScriptCreated = $true
+    wslConfigCreated = $true
+    wslConfigHadExistingFile = $wslConfigHadExistingFile
+    wslConfigBackupContent = $wslConfigBackupContent
+    linuxSetupConfigPath = $linuxSetupConfigPath
+    setupTimeUtc = (Get-Date).ToUniversalTime().ToString("o")
+    pendingFeatureReboot = $true
+  }
+  Write-JsonFile -Path $statePath -Object $state
+
+  Write-Output "WSL features were enabled. Reboot Windows, then rerun this script to finish installing the distro and starting the relay."
+  return
+}
+
+$wslInstallResult = Install-WslUbuntuDistro -DistroName $manifest.distroName
+$wslInstalledBySetup = $wslInstallResult.InstalledNow
+if ($wslInstallResult.NeedsReboot) {
+  Write-Output "Ubuntu was staged by WSL. Reboot Windows, then rerun this script to finish bootstrapping the distro."
+  return
 }
 
 try {
-  if (-not $distroAlreadyExists) {
-    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--import", $manifest.distroName, $installPath, $imagePath, "--version", "2") -Description "Import WSL distro"
-    $wslImported = $true
-  } else {
-    Write-Host "Existing WSL distro '$($manifest.distroName)' detected. Repairing in place."
+  if ($distroAlreadyExists) {
+    Write-Output "Existing WSL distro '$($manifest.distroName)' detected. Repairing in place."
+  }
+  $setupCredentials = Read-OrCreate-SetupProfile -DistroName $manifest.distroName -Path $linuxSetupConfigPath -DefaultLinuxUser $defaultLinuxUser
+  $linuxUser = $setupCredentials.LinuxUser
+  $loginSecretText = $setupCredentials.LinuxPassword
+  $loginPasswordSecure = Convert-PlainTextToSecureString -Text $loginSecretText
+  $loginSecretText = $null
+
+  if ($setupCredentials.Created) {
+    Write-Output "Created Linux setup credentials at $linuxSetupConfigPath."
+  }
+  if ($setupCredentials.Updated) {
+    Write-Output "Updated Linux setup credentials at $linuxSetupConfigPath."
   }
 
-  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--set-default", $manifest.distroName) -Description "Set default WSL distro"
-  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--manage", $manifest.distroName, "--set-default-user", $manifest.linuxUser) -Description "Set default WSL user"
-  Remove-PortProxyForPort -ListenPort $manifest.sshPort
+  Set-LinuxUserConfigured -DistroName $manifest.distroName -LinuxUser $linuxUser -PasswordSecure $loginPasswordSecure
+  Install-OpenSshServerIfMissing -DistroName $manifest.distroName
+  Initialize-LinuxBootstrapConfiguration -DistroName $manifest.distroName -LinuxUser $linuxUser -SshPort $manifest.sshPort -SecurityProfile $linuxSecurityProfile
+  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--shutdown") -Description "Apply Linux bootstrap configuration"
 
   $sshdService = Get-Service sshd -ErrorAction SilentlyContinue
   $sshdServiceExists = $null -ne $sshdService
@@ -649,52 +814,44 @@ try {
     $firewallRulesChanged = $true
   }
 
+  Remove-PortProxyForPort -ListenPort $manifest.sshPort
   New-Item -ItemType Directory -Path $programDataDir -Force | Out-Null
-  $refreshScript = Get-RefreshScriptContent -DistroName $manifest.distroName -Port $manifest.sshPort -ExpectedListenAddress $ListenAddress -ExpectedInterfaceAlias $ListenInterfaceAlias
-  Set-Content -LiteralPath $programDataScriptPath -Value $refreshScript -Encoding UTF8
+  $relayScript = Get-RelayScriptContent -TemplatePath $relayTypeDefinitionTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $ListenAddress -PreferredInterfaceAlias $ListenInterfaceAlias
+  [System.IO.File]::WriteAllText($programDataScriptPath, $relayScript, [System.Text.UTF8Encoding]::new($false))
   $programDataScriptCreated = $true
 
-  Set-Content -LiteralPath $wslConfigPath -Value (Get-WslConfigContent) -Encoding ASCII
+  [System.IO.File]::WriteAllLines($wslConfigPath, [string[]](Get-WslConfigContent -MemoryLimit $manifest.wslMemoryLimit -VmIdleTimeoutMs $manifest.vmIdleTimeoutMs), [System.Text.UTF8Encoding]::new($false))
   $wslConfigCreated = $true
+  Set-ManagedFirewallRule -Port $manifest.sshPort
+  $managedFirewallRuleChanged = $true
 
   $currentUser = Get-CurrentWindowsUser
-  $refreshAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$programDataScriptPath`""
-  $refreshBootTrigger = New-ScheduledTaskTrigger -AtStartup
-  $refreshBootTrigger.Delay = "PT30S"
-  $refreshLogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
-  $refreshLogonTrigger.Delay = "PT30S"
-  $refreshPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType S4U -RunLevel Highest
-  $refreshSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-  Register-ScheduledTask -TaskName $manifest.refreshTaskName -Action $refreshAction -Trigger @($refreshBootTrigger, $refreshLogonTrigger) -Principal $refreshPrincipal -Settings $refreshSettings -Force | Out-Null
-  $refreshTaskCreated = $true
+  $relayAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$programDataScriptPath`""
+  $relayBootTrigger = New-ScheduledTaskTrigger -AtStartup
+  $relayBootTrigger.Delay = "PT20S"
+  $relayLogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+  $relayLogonTrigger.Delay = "PT20S"
+  $relayPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType S4U -RunLevel Highest
+  $relaySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+  Register-ScheduledTask -TaskName $manifest.relayTaskName -Action $relayAction -Trigger @($relayBootTrigger, $relayLogonTrigger) -Principal $relayPrincipal -Settings $relaySettings -Force | Out-Null
+  $relayTaskCreated = $true
 
-  $keepAliveAction = New-ScheduledTaskAction -Execute "wsl.exe" -Argument "-d $($manifest.distroName) --exec /bin/sleep infinity"
-  $keepAliveBootTrigger = New-ScheduledTaskTrigger -AtStartup
-  $keepAliveBootTrigger.Delay = "PT20S"
-  $keepAliveLogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
-  $keepAliveLogonTrigger.Delay = "PT20S"
-  $keepAlivePrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType S4U
-  $keepAliveSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-  Register-ScheduledTask -TaskName $manifest.keepAliveTaskName -Action $keepAliveAction -Trigger @($keepAliveBootTrigger, $keepAliveLogonTrigger) -Principal $keepAlivePrincipal -Settings $keepAliveSettings -Force | Out-Null
-  $keepAliveTaskCreated = $true
-
-  Start-ScheduledTask -TaskName $manifest.keepAliveTaskName
+  Start-ScheduledTask -TaskName $manifest.relayTaskName
   Start-Sleep -Seconds 2
-  Start-ScheduledTask -TaskName $manifest.refreshTaskName
-  Start-Sleep -Seconds 5
 
   $state = [ordered]@{
     windowsUser = $currentUser
     listenAddress = $ListenAddress
     listenInterfaceAlias = $ListenInterfaceAlias
     distroName = $manifest.distroName
-    linuxUser = $manifest.linuxUser
-    imagePath = $imagePath
-    installPath = $installPath
-    refreshTaskName = $manifest.refreshTaskName
-    keepAliveTaskName = $manifest.keepAliveTaskName
+    wslInstalledBySetup = $wslInstalledBySetup
+    linuxUser = $linuxUser
+    relayTaskName = $manifest.relayTaskName
     programDataScriptPath = $programDataScriptPath
+    linuxSetupConfigPath = $linuxSetupConfigPath
     wslConfigCreated = $true
+    wslConfigHadExistingFile = $wslConfigHadExistingFile
+    wslConfigBackupContent = $wslConfigBackupContent
     setupTimeUtc = (Get-Date).ToUniversalTime().ToString("o")
     windowsSshd = [ordered]@{
       serviceExists = $sshdServiceExists
@@ -706,20 +863,20 @@ try {
   }
   Write-JsonFile -Path $statePath -Object $state
 
-  Write-Host "Setup complete."
-  Write-Host "ListenAddress: $ListenAddress"
-  Write-Host "ListenInterfaceAlias: $ListenInterfaceAlias"
-  Write-Host "Distro: $($manifest.distroName)"
-  Write-Host "SSH: ssh -p $($manifest.sshPort) $($manifest.linuxUser)@$ListenAddress"
+  Write-Output "Setup complete."
+  Write-Output "ListenAddress: $ListenAddress"
+  Write-Output "ListenInterfaceAlias: $ListenInterfaceAlias"
+  Write-Output "Distro: $($manifest.distroName)"
+  Write-Output "SSH: ssh -p $($manifest.sshPort) $linuxUser@$ListenAddress"
 }
 catch {
   try {
     Restore-PartialSetup `
-      -RefreshTaskCreated $refreshTaskCreated `
-      -KeepAliveTaskCreated $keepAliveTaskCreated `
+      -RelayTaskCreated $relayTaskCreated `
       -ProgramDataScriptCreated $programDataScriptCreated `
       -WslConfigCreated $wslConfigCreated `
-      -WslImported $wslImported `
+      -ManagedFirewallRuleChanged $managedFirewallRuleChanged `
+      -WslInstalledBySetup $wslInstalledBySetup `
       -SshdStateChanged $sshdStateChanged `
       -FirewallRulesChanged $firewallRulesChanged `
       -SshdServiceExists $sshdServiceExists `
@@ -730,12 +887,12 @@ catch {
       -DistroName $manifest.distroName `
       -ProgramDataScriptPath $programDataScriptPath `
       -WslConfigPath $wslConfigPath `
-      -InstallPath $installPath `
-      -RefreshTaskName $manifest.refreshTaskName `
-      -KeepAliveTaskName $manifest.keepAliveTaskName
+      -WslConfigHadExistingFile $wslConfigHadExistingFile `
+      -WslConfigBackupContent $wslConfigBackupContent `
+      -SshPort $manifest.sshPort `
+      -RelayTaskName $manifest.relayTaskName
   } catch {
     Write-Warning "Rollback encountered an issue: $($_.Exception.Message)"
   }
   throw
 }
-

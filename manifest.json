@@ -1,11 +1,13 @@
 {
   "distroName": "Ubuntu",
-  "linuxUser": "ubuntu",
+  "setupDefaultsPath": "setup-defaults.json",
+  "linuxSecurityProfilePath": "linux-security-profile.json",
+  "linuxSetupConfigPath": "/var/lib/wslssh-lan/setup.json",
+  "relayTypeDefinitionTemplatePath": "templates\\WslSshRelay.TypeDefinition.cs",
   "sshPort": 2222,
-  "imagePath": "artifacts\\ubuntu-ssh-image.tar",
-  "imageReleaseAssetName": "ubuntu-ssh-image.tar",
-  "installPath": "instances\\Ubuntu",
-  "programDataScriptPath": "C:\\ProgramData\\WslSshLan\\Update-WslSshLan.ps1",
-  "refreshTaskName": "WSL SSH LAN Refresh",
-  "keepAliveTaskName": "WSL Ubuntu KeepAlive"
+  "wslMemoryLimit": "12GB",
+  "vmIdleTimeoutMs": 15000,
+  "relayIdleShutdownSeconds": 300,
+  "programDataScriptPath": "C:\\ProgramData\\WslSshLan\\WslSshRelay.ps1",
+  "relayTaskName": "WSL SSH Relay"
 }

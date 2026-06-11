@@ -1,24 +1,33 @@
 # WSL Ubuntu SSH Recovery Kit
 
-This repository captures a restorable WSL2 Ubuntu instance and the Windows-side automation needed to bring back LAN-accessible SSH after a reset or reinstall.
+This repository bootstraps a clean Ubuntu WSL distro and wires it for LAN-accessible SSH. It no longer depends on a local tar image or any GitHub release asset.
 
 ## What this repository contains
 
-- `artifacts/ubuntu-ssh-image.tar`
-  - Exported WSL root filesystem image of the `Ubuntu` distro
-  - Ignored by git because it is large and machine-specific
-  - If missing locally, `setup-ubuntu-ssh.ps1` can fetch it from a GitHub Release asset
 - `manifest.json`
-  - Single source of truth for distro name, Linux user, SSH port, task names, and paths
+  - Single source of truth for distro name, SSH port, resource limits, task names, and script paths
+- `setup-defaults.json`
+  - Repository default for the Linux username
+- `linux-security-profile.json`
+  - Repository copy of the current Ubuntu SSH hardening baseline
+  - Used to render `/etc/wsl.conf` and the managed sshd drop-in during setup
+- `templates/WslSshRelay.TypeDefinition.cs`
+  - Relay C# type definition template stored in the repository
+  - Rendered into the PowerShell relay wrapper that `setup-ubuntu-ssh.ps1` writes to `C:\ProgramData\WslSshLan\WslSshRelay.ps1`
+- `/var/lib/wslssh-lan/setup.json`
+  - Created inside the Ubuntu distro on first run
+  - Stores the generated or custom Linux password outside the git repo
+- `validate-fixtures.json`
+  - Test fixtures used by `validate-repository.ps1`
 - `setup-ubuntu-ssh.ps1`
-  - Restores the Ubuntu instance from the tar image
-  - Rebuilds host-side SSH forwarding, firewall rule, scheduled tasks, and keep-alive behavior
-  - Rebinds the LAN listener from the active interface on every boot so DHCP changes do not break SSH
+  - Installs Ubuntu directly with `wsl --install -d Ubuntu --web-download --no-launch`
+  - Creates the Linux user, installs `openssh-server`, and writes `/etc/wsl.conf` plus an sshd drop-in
+  - Rebuilds the Windows-side SSH relay, inbound firewall rule, scheduled task, and idle-shutdown behavior
+  - Renders the relay C# type definition from the repository template instead of hardcoding that block inline
+  - Forces console output and relay logs to UTF-8 so localized interface names and other non-ASCII text stay readable
 - `uninstall-ubuntu-ssh.ps1`
-  - Removes the imported distro and host-side runtime configuration
-  - Preserves the tar image, manifest, and scripts for later reuse
-- `instances/`
-  - Import target directory used by `wsl --import`
+  - Removes the Ubuntu distro and host-side runtime configuration
+  - Preserves the PowerShell scripts and manifest for later reuse
 - `state/setup-state.json`
   - Generated after setup
   - Used by uninstall to restore prior Windows SSH service and firewall state
@@ -27,14 +36,16 @@ This repository captures a restorable WSL2 Ubuntu instance and the Windows-side 
 
 The setup flow is designed for a clean Windows host:
 
-- imports `Ubuntu` as WSL2
-- sets default WSL user to `ubuntu`
+- enables the required WSL Windows features if they are missing
+- installs Ubuntu directly through WSL
+- sets the default Linux user from `setup-defaults.json`, with `ubuntu` as the packaged default username
+- applies the SSH and WSL hardening template from `linux-security-profile.json`
+- stores the generated password inside `/var/lib/wslssh-lan/setup.json`
 - keeps SSH on port `2222`
 - allows password login inside WSL
-- exposes SSH to devices on the local subnet through Windows `portproxy`
+- exposes SSH to devices on the local subnet through a lightweight Windows relay listener
 - disables Windows host `sshd` to avoid exposing port `22`
-- recreates the forwarding path automatically after reboot via scheduled tasks
-- keeps the WSL VM alive after boot so the SSH daemon stays reachable without a manual login
+- starts WSL on the first SSH connection, then terminates it again after the configured idle window when no SSH sessions remain
 
 ## Usage
 
@@ -47,14 +58,19 @@ Run from an elevated PowerShell session.
 .\setup-ubuntu-ssh.ps1 -ListenAddress 192.0.2.10
 ```
 
-If an `Ubuntu` distro already exists, setup repairs it in place instead of forcing a reinstall.
+If WSL features are not enabled yet, the script stages the install, then asks for a reboot at the end so the remaining WSL-specific steps can be finished after Windows comes back up. After reboot, run the same command again.
 
-If WSL features are not enabled yet, the script enables them and exits. After reboot, run the same command again.
+If Ubuntu is not installed yet, setup installs it directly through WSL, then bootstraps the distro in place.
 
-If `artifacts\ubuntu-ssh-image.tar` is not present, setup tries these sources in order:
+If `setup-defaults.json` is not present, setup stops because it needs the repository default username.
 
-- `manifest.json` field `imageDownloadUrl`, if configured
-- the repository's GitHub `origin` remote, using the latest release asset named `ubuntu-ssh-image.tar`
+If `/var/lib/wslssh-lan/setup.json` is not present, setup creates it inside the Ubuntu distro from the repository defaults and generates a new password, then uses those values to configure the distro.
+
+To inspect the generated credentials later, read that file from inside WSL as root:
+
+```powershell
+wsl.exe -d Ubuntu -u root -- cat /var/lib/wslssh-lan/setup.json
+```
 
 ### Uninstall
 
@@ -68,86 +84,38 @@ If `artifacts\ubuntu-ssh-image.tar` is not present, setup tries these sources in
 .\validate-repository.ps1
 ```
 
-This runs a static sanity check over the manifest, setup script, uninstall script, generated refresh script, and GitHub origin parsing logic.
+This runs a static sanity check over the manifest, setup script, uninstall script, generated relay script, and Linux bootstrap configuration logic.
 
-This removes:
+## Troubleshooting
 
-- the imported `Ubuntu` distro
-- the `instances\Ubuntu` directory
-- scheduled tasks
-- the Windows firewall rule for port `2222`
-- the managed Windows `portproxy` entry for port `2222`
-- the generated `ProgramData` refresh script
+### SSH says "REMOTE HOST IDENTIFICATION HAS CHANGED"
 
-This keeps:
+If the Ubuntu instance was reinstalled, SSH host keys inside WSL were regenerated. In that case, SSH clients that connected before will still have the old host key cached in `~/.ssh/known_hosts`, and they will refuse to connect until that stale entry is removed.
 
-- `artifacts\ubuntu-ssh-image.tar`
-- `manifest.json`
-- `setup-ubuntu-ssh.ps1`
-- `uninstall-ubuntu-ssh.ps1`
+On the client machine, remove the old key for this host and reconnect:
+
+```bash
+ssh-keygen -R "[192.0.2.10]:2222"
+ssh -p 2222 ubuntu@192.0.2.10
+```
+
+When prompted, verify and accept the new host key with `yes`.
+
+If the client reported a specific offending line in `~/.ssh/known_hosts`, deleting that line manually works too.
 
 ## Safety notes
 
 - `setup-ubuntu-ssh.ps1` repairs an existing `Ubuntu` distro in place, and refreshes `.wslconfig`, scheduled tasks, and `ProgramData` scripts as needed.
-- `.wslconfig` is written with `networkingMode=nat`, `firewall=true`, and `vmIdleTimeout=86400000` to reduce idle shutdowns and stale forwarding state.
-- the refresh task retries until the LAN interface and WSL SSH listener are both ready, then rewrites the Windows `portproxy` and firewall rules
+- if `%USERPROFILE%\.wslconfig` already existed before setup, the script preserves its previous contents in state and restores them on uninstall or rollback
+- `setup-ubuntu-ssh.ps1` and the generated relay script force UTF-8 output, so log files and localized interface names should remain readable end to end.
+- the repository `setup-defaults.json` file stores the default Linux username, `linux-security-profile.json` stores the reusable Linux security baseline, and `/var/lib/wslssh-lan/setup.json` inside the distro stores the generated or custom password for the machine
+- `.wslconfig` is written with `memory=12GB`, `networkingMode=nat`, `firewall=true`, `vmIdleTimeout=15000`, and `autoMemoryReclaim=dropCache` to keep the VM small when idle and return unused pages to Windows quickly
+- the relay task starts WSL only when an SSH client connects, waits for `sshd` inside WSL to come up, and then proxies the SSH stream
 - the Windows firewall allow rule is scoped to `Domain,Private`, `LocalSubnet`, and TCP `2222`
 - the WSL sshd policy remains password-based by design for broad client compatibility on the LAN
+- if you want long-running training jobs to survive a disconnect, keep the session open with `tmux`/`screen` or raise `relayIdleShutdownSeconds` in `manifest.json`
 
 ## Suggested repo workflow
 
 - track `README.md`, `manifest.json`, and the PowerShell scripts in git
-- keep the tar image outside git unless you intentionally move it into Git LFS or another artifact store
-- regenerate `artifacts/ubuntu-ssh-image.tar` whenever you want to capture a new known-good Ubuntu state
-
-## How to distribute the image with this repository
-
-By default, `artifacts/ubuntu-ssh-image.tar` is ignored by git because it is large. The repository stays independently runnable by downloading the image from a Release asset when needed, and you still have three practical ways to ship it together with this project.
-
-### Option 1: GitHub Release asset (recommended)
-
-Use the git repository for scripts and metadata, and upload the tar image as a Release asset.
-
-Workflow:
-
-1. push this repository to GitHub
-2. create a tagged release
-3. upload `artifacts/ubuntu-ssh-image.tar` to that release
-4. on a new machine, clone the repository and run `.\setup-ubuntu-ssh.ps1`
-
-The setup script will automatically download the release asset into `artifacts\ubuntu-ssh-image.tar`.
-
-This keeps normal git operations fast and avoids committing a 10 GB binary into repository history.
-
-### Option 2: Git LFS
-
-If you want the image to travel through git itself, use Git LFS.
-
-Example:
-
-```powershell
-git lfs install
-git lfs track "artifacts/ubuntu-ssh-image.tar"
-git add .gitattributes artifacts/ubuntu-ssh-image.tar
-git commit -m "Track WSL image with Git LFS"
-```
-
-If you choose Git LFS, remove the image line from `.gitignore` first:
-
-```text
-artifacts/ubuntu-ssh-image.tar
-```
-
-This approach works, but it depends on Git LFS being enabled on the remote and can consume storage and bandwidth quotas quickly.
-
-### Option 3: Keep the image outside git and place it manually
-
-For private use, the simplest path is often:
-
-1. commit only the scripts and `manifest.json`
-2. copy `ubuntu-ssh-image.tar` through a portable drive, NAS, cloud disk, or LAN share
-3. place it at `artifacts\ubuntu-ssh-image.tar`
-4. run `.\setup-ubuntu-ssh.ps1`
-
-This repository is already prepared for that workflow.
-
+- regenerate the Ubuntu bootstrap behavior by editing the scripts, not by committing a tar image

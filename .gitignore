@@ -1,5 +1,4 @@
-artifacts/ubuntu-ssh-image.tar
-instances/
 state/setup-state.json
+state/*.log
 .DS_Store
 Thumbs.db

@@ -1,0 +1,31 @@
+{
+  "wslConfTemplateLines": [
+    "[boot]",
+    "systemd=true",
+    "",
+    "[user]",
+    "default=__DEFAULT_LINUX_USER__"
+  ],
+  "sshdTemplateLines": [
+    "# Derived from the current Ubuntu SSH hardening baseline",
+    "Port __SSH_PORT__",
+    "AddressFamily inet",
+    "ListenAddress 0.0.0.0",
+    "",
+    "PasswordAuthentication yes",
+    "KbdInteractiveAuthentication no",
+    "PubkeyAuthentication no",
+    "PermitEmptyPasswords no",
+    "PermitRootLogin no",
+    "AllowUsers __DEFAULT_LINUX_USER__",
+    "",
+    "X11Forwarding no",
+    "AllowTcpForwarding no",
+    "AllowAgentForwarding no",
+    "PermitTunnel no",
+    "DisableForwarding yes",
+    "PermitUserEnvironment no",
+    "MaxAuthTries 3",
+    "LoginGraceTime 30"
+  ]
+}

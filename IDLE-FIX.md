@@ -1,21 +1,27 @@
-# WSL idle fix
+# WSL low-resource relay
 
-Applied on 2026-06-10.
+Applied on 2026-06-11.
 
 ## What changed
 
-- `C:\Users\Wota\.wslconfig` now uses:
+- `%USERPROFILE%\.wslconfig` is now written with:
+  - `memory=12GB`
   - `networkingMode=nat`
   - `firewall=true`
-  - `vmIdleTimeout=86400000`
-- `setup-ubuntu-ssh.ps1` now writes the same `.wslconfig` values during future setup runs.
-- `setup-ubuntu-ssh.ps1` records the active LAN interface alias and lets the refresh task retry until the network and WSL SSH listener are both ready.
-- the refresh task now rebuilds the Windows `portproxy` and firewall rule instead of relying on stale IPs.
-- `README.md` was updated to reflect the new idle-resilience settings.
+  - `vmIdleTimeout=15000`
+  - `autoMemoryReclaim=dropCache`
+- `setup-ubuntu-ssh.ps1` now provisions a Windows-side SSH relay task instead of a permanent WSL keep-alive process.
+- the relay starts WSL only when an SSH client connects, then shuts the distro down again after the configured idle window if no sessions remain.
+- setup now recreates a dedicated inbound Windows Firewall rule for the relay port and removes it again during uninstall.
+- console output and relay log files are written in UTF-8 so localized interface names stay readable.
+- if `%USERPROFILE%\.wslconfig` already existed, setup now restores that original file during uninstall or rollback instead of deleting it outright.
+- the Windows relay C# type definition now lives as a repository template and is rendered into the generated relay script during setup, instead of being embedded inline in the setup script.
+- the repository `setup-defaults.json` file now provides the default Linux username, and the root-only `/var/lib/wslssh-lan/setup.json` file inside the distro stores the generated password.
+- `README.md` now documents the on-demand relay flow and the tradeoff for long-running jobs.
 
 ## Why
 
-This reduces the chance that WSL 2 becomes unreachable from external SSH clients after being idle for a while. The main mitigation is increasing the VM idle timeout, keeping a permanent WSL process alive, and making the startup refresh task resilient to DHCP and boot timing.
+This keeps idle memory and power use low without giving up LAN SSH access. The host keeps only a small Windows listener alive, while WSL is started on demand and terminated again after it has been idle for a while.
 
 ## Apply
 
@@ -25,10 +31,5 @@ Run:
 wsl --shutdown
 ```
 
-Then start the distro again. If OpenSSH inside WSL is managed by systemd, make sure it is enabled:
-
-```bash
-sudo systemctl enable ssh
-sudo systemctl restart ssh
-```
+If WSL features were just enabled, rerun `.\setup-ubuntu-ssh.ps1` after reboot so the remaining WSL-specific steps can finish. The script now asks for that reboot at the end of the staging pass instead of stopping immediately after feature enablement.
 
