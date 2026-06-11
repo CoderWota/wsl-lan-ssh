@@ -16,7 +16,7 @@ Applied on 2026-06-11.
 - console output and relay log files are written in UTF-8 so localized interface names stay readable.
 - if `%USERPROFILE%\.wslconfig` already existed, setup now restores that original file during uninstall or rollback instead of deleting it outright.
 - the Windows relay C# type definition now lives as a repository template and is rendered into the generated relay script during setup, instead of being embedded inline in the setup script.
-- the repository `setup-defaults.json` file now provides the default Linux username, and the root-only `/var/lib/wslssh-lan/setup.json` file inside the distro stores the generated password.
+- the repository `setup-defaults.json` file now provides the default Linux username, setup prompts for a Linux password during first bootstrap or explicit reset, and the root-only `/var/lib/wslssh-lan/setup.json` file inside the distro stores only repository-managed Linux setup metadata.
 - `README.md` now documents the on-demand relay flow and the tradeoff for long-running jobs.
 
 ## Why

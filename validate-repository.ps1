@@ -183,11 +183,20 @@ $setupScriptChecks = @(
   "openssh-server",
   "99-wsl-ssh-lan.conf",
   "New-NetFirewallRule",
-  "wslConfigBackupContent"
+  "wslConfigBackupContent",
+  "Read-Host -AsSecureString",
+  "ResetLinuxPassword",
+  "Test-InteractivePromptAvailable",
+  "cannot prompt interactively"
 )
 foreach ($needle in $setupScriptChecks) {
   Assert-Condition -Condition ($setupContent -match [regex]::Escape($needle)) -Message "setup-ubuntu-ssh.ps1 must contain '$needle'."
 }
+Assert-Condition -Condition (-not ($setupContent -match "Guid\(\)::NewGuid|NewGuid\(\)")) -Message "setup-ubuntu-ssh.ps1 must not generate a default Linux password."
+
+$defaultSetupProfile = Get-DefaultSetupProfile -DefaultLinuxUser $setupDefaults.defaultLinuxUser
+Assert-Condition -Condition ($defaultSetupProfile.Contains("linuxUser")) -Message "Default setup profile must contain linuxUser."
+Assert-Condition -Condition (-not $defaultSetupProfile.Contains("linuxPassword")) -Message "Default setup profile must not contain a generated password."
 
 $generatedRelayScript = Get-RelayScriptContent -TemplatePath $relayTypeDefinitionTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $validateFixtures.preferredListenAddress -PreferredInterfaceAlias $validateFixtures.preferredInterfaceAlias
 Assert-Condition -Condition ($generatedRelayScript -match "TcpListener") -Message "Generated relay script does not create a TCP listener."

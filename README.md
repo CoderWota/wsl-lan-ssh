@@ -1,121 +1,210 @@
-# WSL Ubuntu SSH Recovery Kit
+# Windows WSL Ubuntu LAN SSH Kit
 
-This repository bootstraps a clean Ubuntu WSL distro and wires it for LAN-accessible SSH. It no longer depends on a local tar image or any GitHub release asset.
+Installing WSL is easy. Turning it into a clean, repeatable, LAN-accessible Ubuntu environment is usually not.
 
-## What this repository contains
+This repository exists to remove that friction. It installs and manages a dedicated `Ubuntu` WSL instance, configures SSH for it, and exposes it to other devices on your local network through a lightweight Windows-side relay. The goal is to make a personal Windows PC much easier to use as an AI agent host, a lightweight training box, or a LAN-reachable Ubuntu machine for development work, without leaving a full WSL VM running all the time.
 
-- `manifest.json`
-  - Single source of truth for distro name, SSH port, resource limits, task names, and script paths
-- `setup-defaults.json`
-  - Repository default for the Linux username
-- `linux-security-profile.json`
-  - Repository copy of the current Ubuntu SSH hardening baseline
-  - Used to render `/etc/wsl.conf` and the managed sshd drop-in during setup
-- `templates/WslSshRelay.TypeDefinition.cs`
-  - Relay C# type definition template stored in the repository
-  - Rendered into the PowerShell relay wrapper that `setup-ubuntu-ssh.ps1` writes to `C:\ProgramData\WslSshLan\WslSshRelay.ps1`
-- `/var/lib/wslssh-lan/setup.json`
-  - Created inside the Ubuntu distro on first run
-  - Stores the generated or custom Linux password outside the git repo
-- `validate-fixtures.json`
-  - Test fixtures used by `validate-repository.ps1`
-- `setup-ubuntu-ssh.ps1`
-  - Installs Ubuntu directly with `wsl --install -d Ubuntu --web-download --no-launch`
-  - Creates the Linux user, installs `openssh-server`, and writes `/etc/wsl.conf` plus an sshd drop-in
-  - Rebuilds the Windows-side SSH relay, inbound firewall rule, scheduled task, and idle-shutdown behavior
-  - Renders the relay C# type definition from the repository template instead of hardcoding that block inline
-  - Forces console output and relay logs to UTF-8 so localized interface names and other non-ASCII text stay readable
-- `uninstall-ubuntu-ssh.ps1`
-  - Removes the Ubuntu distro and host-side runtime configuration
-  - Preserves the PowerShell scripts and manifest for later reuse
-- `state/setup-state.json`
-  - Generated after setup
-  - Used by uninstall to restore prior Windows SSH service and firewall state
+## Why this exists
 
-## Expected behavior
+Configuring WSL for this kind of use case is usually more annoying than it should be:
 
-The setup flow is designed for a clean Windows host:
+- installing Ubuntu in WSL is only the first step
+- enabling SSH properly inside WSL takes extra manual work
+- making other devices on your home LAN reach that WSL instance is even more awkward
+- repeating the same setup on another Windows machine is tedious and error-prone
+- keeping WSL always alive just so SSH stays reachable wastes memory and power
 
-- enables the required WSL Windows features if they are missing
-- installs Ubuntu directly through WSL
-- sets the default Linux user from `setup-defaults.json`, with `ubuntu` as the packaged default username
-- applies the SSH and WSL hardening template from `linux-security-profile.json`
-- stores the generated password inside `/var/lib/wslssh-lan/setup.json`
-- keeps SSH on port `2222`
-- allows password login inside WSL
-- exposes SSH to devices on the local subnet through a lightweight Windows relay listener
-- disables Windows host `sshd` to avoid exposing port `22`
-- starts WSL on the first SSH connection, then terminates it again after the configured idle window when no SSH sessions remain
+This project is for the "my Windows PC should also act like a simple Ubuntu box" scenario:
 
-## Usage
+- you want to host AI agents on your own Windows machine
+- you want to run deep learning or other long-running workloads in WSL
+- you want to SSH into that Ubuntu environment from a laptop, another desktop, or another device on your LAN
+- you want the setup to be scripted, reproducible, and easy to reinstall
 
-Run from an elevated PowerShell session.
+## What setup does
 
-### Setup
+Running `setup-ubuntu-ssh.ps1` will:
+
+- install or repair the managed WSL distro named `Ubuntu`
+- create or refresh the default Linux user from `setup-defaults.json`
+- prompt for a Linux password on first bootstrap, or when you explicitly reset it
+- install `openssh-server` inside Ubuntu
+- write `/etc/wsl.conf`
+- write a managed SSH drop-in at `/etc/ssh/sshd_config.d/99-wsl-ssh-lan.conf`
+- create a Windows scheduled task named `WSL SSH Relay`
+- create a Windows firewall rule for TCP `2222`
+- write `%USERPROFILE%\.wslconfig` with idle-friendly WSL settings
+
+The managed SSH policy is:
+
+- port `2222`
+- password login enabled
+- root login disabled
+- `AllowUsers ubuntu`
+- forwarding features disabled
+
+## Quick Start
+
+Run all commands from an elevated PowerShell window.
+
+### First install
 
 ```powershell
 .\setup-ubuntu-ssh.ps1
-.\setup-ubuntu-ssh.ps1 -ListenAddress 192.0.2.10
 ```
 
-If WSL features are not enabled yet, the script stages the install, then asks for a reboot at the end so the remaining WSL-specific steps can be finished after Windows comes back up. After reboot, run the same command again.
+By default, setup automatically chooses a suitable LAN IPv4 address from an active `Private` or `DomainAuthenticated` adapter.
 
-If Ubuntu is not installed yet, setup installs it directly through WSL, then bootstraps the distro in place.
+If the Linux user does not exist yet, setup will ask you to enter and confirm a password. That password must be at least 8 characters long and must not contain a colon or newline.
 
-If `setup-defaults.json` is not present, setup stops because it needs the repository default username.
+### Choose a specific listen address
 
-If `/var/lib/wslssh-lan/setup.json` is not present, setup creates it inside the Ubuntu distro from the repository defaults and generates a new password, then uses those values to configure the distro.
+```powershell
+.\setup-ubuntu-ssh.ps1 -ListenAddress <your-lan-ipv4-address>
+```
 
-To inspect the generated credentials later, read that file from inside WSL as root:
+Use this only when you want to pin the relay to a specific address on the host.
+
+### Non-interactive install
+
+If setup is being launched through automation or a hidden elevated window, pass the password explicitly so the script does not need to prompt:
+
+```powershell
+$linuxPassword = Read-Host -AsSecureString "Linux password"
+.\setup-ubuntu-ssh.ps1 -LinuxPassword $linuxPassword
+```
+
+### Reset the Linux password later
+
+```powershell
+.\setup-ubuntu-ssh.ps1 -ResetLinuxPassword
+```
+
+If the user already exists, ordinary reruns of setup leave the current Linux password unchanged unless you explicitly pass `-LinuxPassword` or `-ResetLinuxPassword`.
+
+## After setup
+
+At the end of setup, the script prints the SSH command you should use.
+
+With the current defaults, it looks like this:
+
+```bash
+ssh -p 2222 ubuntu@<host-lan-ip>
+```
+
+If you need to inspect the repository-managed Linux setup metadata later:
 
 ```powershell
 wsl.exe -d Ubuntu -u root -- cat /var/lib/wslssh-lan/setup.json
 ```
 
-### Uninstall
+That file stores only repository-managed metadata such as the Linux username. It does not store the Linux password.
+
+## Uninstall
+
+To remove the managed Ubuntu instance and the Windows-side relay configuration:
 
 ```powershell
 .\uninstall-ubuntu-ssh.ps1
 ```
 
-### Validate
+Important:
+
+- the uninstall script removes only the distro named in `manifest.json`
+- by default, that distro name is `Ubuntu`
+- it does not remove unrelated WSL distros such as `UbuntuCheck`
+
+## Validation
+
+To run the repository consistency checks:
 
 ```powershell
 .\validate-repository.ps1
 ```
 
-This runs a static sanity check over the manifest, setup script, uninstall script, generated relay script, and Linux bootstrap configuration logic.
+This validates the manifest, template rendering, generated relay script, and key setup assumptions.
 
-## Troubleshooting
+## Common Issues
 
 ### SSH says "REMOTE HOST IDENTIFICATION HAS CHANGED"
 
-If the Ubuntu instance was reinstalled, SSH host keys inside WSL were regenerated. In that case, SSH clients that connected before will still have the old host key cached in `~/.ssh/known_hosts`, and they will refuse to connect until that stale entry is removed.
+This usually means the Ubuntu instance was reinstalled and its SSH host keys changed.
 
-On the client machine, remove the old key for this host and reconnect:
+On the client machine:
 
 ```bash
-ssh-keygen -R "[192.0.2.10]:2222"
-ssh -p 2222 ubuntu@192.0.2.10
+ssh-keygen -R "[<host-lan-ip>]:2222"
+ssh -p 2222 ubuntu@<host-lan-ip>
 ```
 
-When prompted, verify and accept the new host key with `yes`.
+Then verify the new host key and answer `yes`.
 
-If the client reported a specific offending line in `~/.ssh/known_hosts`, deleting that line manually works too.
+If your SSH client points to a specific offending line in `~/.ssh/known_hosts`, deleting that line manually is also fine.
 
-## Safety notes
+### Setup seems stuck during password configuration
 
-- `setup-ubuntu-ssh.ps1` repairs an existing `Ubuntu` distro in place, and refreshes `.wslconfig`, scheduled tasks, and `ProgramData` scripts as needed.
-- if `%USERPROFILE%\.wslconfig` already existed before setup, the script preserves its previous contents in state and restores them on uninstall or rollback
-- `setup-ubuntu-ssh.ps1` and the generated relay script force UTF-8 output, so log files and localized interface names should remain readable end to end.
-- the repository `setup-defaults.json` file stores the default Linux username, `linux-security-profile.json` stores the reusable Linux security baseline, and `/var/lib/wslssh-lan/setup.json` inside the distro stores the generated or custom password for the machine
-- `.wslconfig` is written with `memory=12GB`, `networkingMode=nat`, `firewall=true`, `vmIdleTimeout=15000`, and `autoMemoryReclaim=dropCache` to keep the VM small when idle and return unused pages to Windows quickly
-- the relay task starts WSL only when an SSH client connects, waits for `sshd` inside WSL to come up, and then proxies the SSH stream
-- the Windows firewall allow rule is scoped to `Domain,Private`, `LocalSubnet`, and TCP `2222`
-- the WSL sshd policy remains password-based by design for broad client compatibility on the LAN
-- if you want long-running training jobs to survive a disconnect, keep the session open with `tmux`/`screen` or raise `relayIdleShutdownSeconds` in `manifest.json`
+If setup is running in a hidden elevated window or another non-interactive context, it cannot prompt for a password.
 
-## Suggested repo workflow
+Use:
 
-- track `README.md`, `manifest.json`, and the PowerShell scripts in git
-- regenerate the Ubuntu bootstrap behavior by editing the scripts, not by committing a tar image
+```powershell
+$linuxPassword = Read-Host -AsSecureString "Linux password"
+.\setup-ubuntu-ssh.ps1 -LinuxPassword $linuxPassword
+```
+
+Or rerun setup manually in a visible elevated PowerShell window.
+
+### `wsl` still opens Ubuntu after uninstall
+
+Check which distro is still registered:
+
+```powershell
+wsl -l -v
+```
+
+This repository only manages the distro named in `manifest.json`. If another distro remains registered and is set as default, plain `wsl` will still open that one.
+
+## Managed files and configuration
+
+Key repository files:
+
+- `manifest.json`
+  - central configuration for distro name, SSH port, relay settings, and file paths
+- `setup-defaults.json`
+  - default Linux username
+- `linux-security-profile.json`
+  - reusable Linux-side WSL and SSH baseline
+- `templates/WslSshRelay.TypeDefinition.cs`
+  - C# relay template rendered into the generated PowerShell relay script
+- `setup-ubuntu-ssh.ps1`
+  - install and repair entry point
+- `uninstall-ubuntu-ssh.ps1`
+  - uninstall entry point
+- `validate-repository.ps1`
+  - repository self-check
+
+Managed runtime paths:
+
+- `%USERPROFILE%\.wslconfig`
+- `C:\ProgramData\WslSshLan\WslSshRelay.ps1`
+- `/var/lib/wslssh-lan/setup.json`
+- `state/setup-state.json`
+
+## Notes
+
+- `%USERPROFILE%\.wslconfig` is written with:
+  - `memory=12GB`
+  - `networkingMode=nat`
+  - `firewall=true`
+  - `vmIdleTimeout=15000`
+  - `autoMemoryReclaim=dropCache`
+- the Windows firewall rule is scoped to `Domain,Private` and `LocalSubnet`
+- the relay starts WSL on demand and lets it shut down again after the configured idle window
+- if `%USERPROFILE%\.wslconfig` already existed before setup, the previous content is preserved and restored during uninstall or rollback
+- if you want long-running training jobs to survive disconnects, use `tmux` or `screen`, or increase `relayIdleShutdownSeconds` in `manifest.json`
+
+## Publishing / contribution notes
+
+- keep `README.md`, `manifest.json`, and the PowerShell scripts in git
+- change the bootstrap logic by editing the scripts and templates in this repo
+- do not treat a local WSL image as the source of truth

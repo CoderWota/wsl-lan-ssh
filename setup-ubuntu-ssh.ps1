@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-  [string]$ListenAddress
+  [string]$ListenAddress,
+  [securestring]$LinuxPassword,
+  [switch]$ResetLinuxPassword
 )
 
 $ErrorActionPreference = "Stop"
@@ -156,7 +158,60 @@ function Get-DefaultSetupProfile {
 
   return [ordered]@{
     linuxUser = $DefaultLinuxUser
-    linuxPassword = "Wsl-" + ([Guid]::NewGuid().ToString("N"))
+  }
+}
+
+function Get-LinuxPasswordValidationError {
+  param([AllowEmptyString()][string]$CandidateText)
+
+  if ([string]::IsNullOrWhiteSpace($CandidateText)) {
+    return "The Linux password cannot be blank."
+  }
+
+  if ($CandidateText.Length -lt 8) {
+    return "The Linux password must be at least 8 characters long."
+  }
+
+  if ($CandidateText -match "[\r\n:]") {
+    return "The Linux password cannot contain a colon or newline."
+  }
+
+  return $null
+}
+
+function Test-InteractivePromptAvailable {
+  try {
+    return [Environment]::UserInteractive -and (-not [Console]::IsInputRedirected)
+  } catch {
+    return $false
+  }
+}
+
+function Read-InteractiveLinuxPassword {
+  param([Parameter(Mandatory = $true)][string]$LinuxUser)
+
+  if (-not (Test-InteractivePromptAvailable)) {
+    throw "A Linux password is required, but this session cannot prompt interactively. Rerun setup in an elevated interactive PowerShell window, or pass -LinuxPassword."
+  }
+
+  while ($true) {
+    $passwordSecure = Read-Host -AsSecureString -Prompt "Enter a password for Linux user '$LinuxUser'"
+    $confirmSecure = Read-Host -AsSecureString -Prompt "Confirm the password for Linux user '$LinuxUser'"
+    $passwordText = Convert-SecureStringToPlainText -SecureString $passwordSecure
+    $confirmText = Convert-SecureStringToPlainText -SecureString $confirmSecure
+
+    $validationError = Get-LinuxPasswordValidationError -CandidateText $passwordText
+    if ($validationError) {
+      Write-Warning $validationError
+      continue
+    }
+
+    if ($passwordText -ne $confirmText) {
+      Write-Warning "The Linux password entries did not match. Try again."
+      continue
+    }
+
+    return $passwordSecure
   }
 }
 
@@ -164,7 +219,9 @@ function Read-OrCreate-SetupProfile {
   param(
     [Parameter(Mandatory = $true)][string]$DistroName,
     [Parameter(Mandatory = $true)][string]$Path,
-    [Parameter(Mandatory = $true)][string]$DefaultLinuxUser
+    [Parameter(Mandatory = $true)][string]$DefaultLinuxUser,
+    [securestring]$LinuxPassword,
+    [switch]$ResetLinuxPassword
   )
 
   $defaults = Get-DefaultSetupProfile -DefaultLinuxUser $DefaultLinuxUser
@@ -174,7 +231,7 @@ function Read-OrCreate-SetupProfile {
     try {
       $config = Read-LinuxTextFile -DistroName $DistroName -Path $Path | ConvertFrom-Json
     } catch {
-      throw "Could not read setup credentials from $Path inside distro '$DistroName'. $($_.Exception.Message)"
+      throw "Could not read setup metadata from $Path inside distro '$DistroName'. $($_.Exception.Message)"
     }
   }
 
@@ -184,29 +241,19 @@ function Read-OrCreate-SetupProfile {
     $defaults.linuxUser
   }
 
-  $loginSecretText = if ($config -and ($config.PSObject.Properties.Name -contains "linuxPassword") -and -not [string]::IsNullOrWhiteSpace($config.linuxPassword)) {
-    [string]$config.linuxPassword
-  } else {
-    $defaults.linuxPassword
-  }
-
   if ($linuxUser -notmatch '^[a-z_][a-z0-9_-]*$') {
     throw "linuxUser in $Path must match the standard Linux account pattern [a-z_][a-z0-9_-]*."
   }
 
-  if ($loginSecretText -match "[\r\n:]") {
-    throw "linuxPassword in $Path cannot contain a colon or newline."
-  }
-
   $normalizedConfig = [ordered]@{
     linuxUser = $linuxUser
-    linuxPassword = $loginSecretText
   }
 
   $shouldWrite = -not $config
   if ($config) {
-    $shouldWrite = $shouldWrite -or -not ($config.PSObject.Properties.Name -contains "linuxUser") -or -not ($config.PSObject.Properties.Name -contains "linuxPassword")
-    $shouldWrite = $shouldWrite -or ($config.linuxUser -ne $linuxUser) -or ($config.linuxPassword -ne $loginSecretText)
+    $shouldWrite = $shouldWrite -or -not ($config.PSObject.Properties.Name -contains "linuxUser")
+    $shouldWrite = $shouldWrite -or ($config.linuxUser -ne $linuxUser)
+    $shouldWrite = $shouldWrite -or ($config.PSObject.Properties.Name -contains "linuxPassword")
   }
 
   if ($shouldWrite) {
@@ -214,25 +261,35 @@ function Read-OrCreate-SetupProfile {
     Write-LinuxTextFile -DistroName $DistroName -Path $Path -Text $json -DirectoryMode "700" -FileMode "600"
   }
 
+  $passwordSecure = $null
+  $promptedForPassword = $false
+  $userAlreadyPresent = Test-LinuxUserPresent -DistroName $DistroName -LinuxUser $linuxUser
+  if ($PSBoundParameters.ContainsKey("LinuxPassword")) {
+    $providedPasswordText = Convert-SecureStringToPlainText -SecureString $LinuxPassword
+    $validationError = Get-LinuxPasswordValidationError -CandidateText $providedPasswordText
+    if ($validationError) {
+      throw $validationError
+    }
+    $passwordSecure = $LinuxPassword
+  } elseif ($ResetLinuxPassword -or -not $userAlreadyPresent) {
+    if ($ResetLinuxPassword) {
+      Write-Output "Resetting the Linux password for user '$linuxUser'."
+    } else {
+      Write-Output "No password is set through this repository yet for Linux user '$linuxUser'. Setup will prompt for one now."
+    }
+    $passwordSecure = Read-InteractiveLinuxPassword -LinuxUser $linuxUser
+    $promptedForPassword = $true
+  }
+
   return [pscustomobject]@{
     Path = $Path
     LinuxUser = $linuxUser
-    LinuxPassword = $loginSecretText
+    PasswordSecure = $passwordSecure
     Created = -not $config
     Updated = $shouldWrite -and $config
+    PromptedForPassword = $promptedForPassword
+    UserAlreadyPresent = $userAlreadyPresent
   }
-}
-
-function Convert-PlainTextToSecureString {
-  param([Parameter(Mandatory = $true)][string]$Text)
-
-  $secure = [System.Security.SecureString]::new()
-  foreach ($character in $Text.ToCharArray()) {
-    $secure.AppendChar($character)
-  }
-
-  $secure.MakeReadOnly()
-  return $secure
 }
 
 function Convert-SecureStringToPlainText {
@@ -269,18 +326,24 @@ function Set-LinuxUserConfigured {
   param(
     [Parameter(Mandatory = $true)][string]$DistroName,
     [Parameter(Mandatory = $true)][string]$LinuxUser,
-    [Parameter(Mandatory = $true)][securestring]$PasswordSecure
+    [securestring]$PasswordSecure
   )
 
   if ($PSCmdlet.ShouldProcess($LinuxUser, "Configure Linux user in $DistroName")) {
-    $plainPassword = Convert-SecureStringToPlainText -SecureString $PasswordSecure
-    if (-not (Test-LinuxUserPresent -DistroName $DistroName -LinuxUser $LinuxUser)) {
+    $userAlreadyPresent = Test-LinuxUserPresent -DistroName $DistroName -LinuxUser $LinuxUser
+    if (-not $userAlreadyPresent) {
+      if (-not $PSBoundParameters.ContainsKey("PasswordSecure")) {
+        throw "A password must be supplied when creating Linux user '$LinuxUser'."
+      }
       Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/sbin/useradd", "--create-home", "--shell", "/bin/bash", "--groups", "sudo", $LinuxUser) -Description "Create Linux user '$LinuxUser'"
     } else {
       Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/sbin/usermod", "--shell", "/bin/bash", "--append", "--groups", "sudo", $LinuxUser) -Description "Refresh Linux user '$LinuxUser'"
     }
 
-    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/sbin/chpasswd") -InputText ("{0}:{1}" -f $LinuxUser, $plainPassword) -Description "Set password for Linux user '$LinuxUser'"
+    if ($PSBoundParameters.ContainsKey("PasswordSecure")) {
+      $plainPassword = Convert-SecureStringToPlainText -SecureString $PasswordSecure
+      Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/sbin/chpasswd") -InputText ("{0}:{1}" -f $LinuxUser, $plainPassword) -Description "Set password for Linux user '$LinuxUser'"
+    }
   }
 }
 
@@ -773,20 +836,36 @@ try {
   if ($distroAlreadyExists) {
     Write-Output "Existing WSL distro '$($manifest.distroName)' detected. Repairing in place."
   }
-  $setupCredentials = Read-OrCreate-SetupProfile -DistroName $manifest.distroName -Path $linuxSetupConfigPath -DefaultLinuxUser $defaultLinuxUser
+  $setupProfileParams = @{
+    DistroName = $manifest.distroName
+    Path = $linuxSetupConfigPath
+    DefaultLinuxUser = $defaultLinuxUser
+    ResetLinuxPassword = $ResetLinuxPassword
+  }
+  if ($PSBoundParameters.ContainsKey("LinuxPassword")) {
+    $setupProfileParams.LinuxPassword = $LinuxPassword
+  }
+  $setupCredentials = Read-OrCreate-SetupProfile @setupProfileParams
   $linuxUser = $setupCredentials.LinuxUser
-  $loginSecretText = $setupCredentials.LinuxPassword
-  $loginPasswordSecure = Convert-PlainTextToSecureString -Text $loginSecretText
-  $loginSecretText = $null
 
   if ($setupCredentials.Created) {
-    Write-Output "Created Linux setup credentials at $linuxSetupConfigPath."
+    Write-Output "Created Linux setup metadata at $linuxSetupConfigPath."
   }
   if ($setupCredentials.Updated) {
-    Write-Output "Updated Linux setup credentials at $linuxSetupConfigPath."
+    Write-Output "Updated Linux setup metadata at $linuxSetupConfigPath."
+  }
+  if ($setupCredentials.PromptedForPassword) {
+    Write-Output "Captured a Linux password interactively for user '$linuxUser'."
   }
 
-  Set-LinuxUserConfigured -DistroName $manifest.distroName -LinuxUser $linuxUser -PasswordSecure $loginPasswordSecure
+  $setLinuxUserParams = @{
+    DistroName = $manifest.distroName
+    LinuxUser = $linuxUser
+  }
+  if ($null -ne $setupCredentials.PasswordSecure) {
+    $setLinuxUserParams.PasswordSecure = $setupCredentials.PasswordSecure
+  }
+  Set-LinuxUserConfigured @setLinuxUserParams
   Install-OpenSshServerIfMissing -DistroName $manifest.distroName
   Initialize-LinuxBootstrapConfiguration -DistroName $manifest.distroName -LinuxUser $linuxUser -SshPort $manifest.sshPort -SecurityProfile $linuxSecurityProfile
   Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--shutdown") -Description "Apply Linux bootstrap configuration"
