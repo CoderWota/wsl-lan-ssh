@@ -8,7 +8,7 @@ Applied on 2026-06-11.
   - `memory=12GB`
   - `networkingMode=nat`
   - `firewall=true`
-  - `vmIdleTimeout=15000`
+  - `vmIdleTimeout=1800000`
   - `autoMemoryReclaim=dropCache`
 - `setup-ubuntu-ssh.ps1` now provisions a Windows-side SSH relay task instead of a permanent WSL keep-alive process.
 - the relay starts WSL only when an SSH client connects, then shuts the distro down again after the configured idle window if no sessions remain.

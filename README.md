@@ -104,7 +104,7 @@ Edit `manifest.json` if you need different runtime settings:
 {
   "sshPort": 2222,
   "wslMemoryLimit": "12GB",
-  "vmIdleTimeoutMs": 15000,
+  "vmIdleTimeoutMs": 1800000,
   "relayIdleShutdownSeconds": 300
 }
 ```
@@ -324,7 +324,7 @@ Managed runtime paths:
   - `memory=12GB`
   - `networkingMode=nat`
   - `firewall=true`
-  - `vmIdleTimeout=15000`
+  - `vmIdleTimeout=1800000`
   - `autoMemoryReclaim=dropCache`
 - the Windows firewall rule is scoped to `Domain,Private` and `LocalSubnet`
 - the relay starts WSL on demand and lets it shut down again after the configured idle window
