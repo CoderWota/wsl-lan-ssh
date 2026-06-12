@@ -104,7 +104,7 @@ Edit `manifest.json` if you need different runtime settings:
 {
   "sshPort": 2222,
   "wslMemoryLimit": "12GB",
-  "vmIdleTimeoutMs": 1800000,
+  "vmIdleTimeoutMs": 15000,
   "relayIdleShutdownSeconds": 300
 }
 ```
@@ -282,6 +282,31 @@ $linuxPassword = Read-Host -AsSecureString "Linux password"
 
 Or rerun setup manually in a visible elevated PowerShell window.
 
+### SSH connects, then closes after about 15 seconds
+
+If an SSH login succeeds and then the connection dies about 10 to 20 seconds later with `closed by remote host`, check the Linux-side logs before changing SSH settings:
+
+```powershell
+wsl.exe -d Ubuntu -u root -- journalctl -u ssh --no-pager -n 50
+wsl.exe -d Ubuntu -u root -- tail -n 100 /var/log/auth.log
+```
+
+If you see `systemd-logind: The system will power off now!` shortly after login, the WSL VM itself is shutting down. That is different from `sshd` rejecting the session, and it also means the relay's own `relayIdleShutdownSeconds` setting is not the thing closing an active SSH session.
+
+`vmIdleTimeoutMs` is read from `%USERPROFILE%\.wslconfig` only when the WSL VM starts. After changing `%USERPROFILE%\.wslconfig`, run:
+
+```powershell
+wsl --shutdown
+```
+
+Then wait until:
+
+```powershell
+wsl --list --running
+```
+
+shows no running distributions before reconnecting. Microsoft documents this as the "8 second rule" for WSL configuration changes.
+
 ### `wsl` still opens Ubuntu after uninstall
 
 Check which distro is still registered:
@@ -324,7 +349,7 @@ Managed runtime paths:
   - `memory=12GB`
   - `networkingMode=nat`
   - `firewall=true`
-  - `vmIdleTimeout=1800000`
+  - `vmIdleTimeout=15000`
   - `autoMemoryReclaim=dropCache`
 - the Windows firewall rule is scoped to `Domain,Private` and `LocalSubnet`
 - the relay starts WSL on demand and lets it shut down again after the configured idle window

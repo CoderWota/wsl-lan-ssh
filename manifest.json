@@ -7,7 +7,7 @@
   "relayPowerShellScriptTemplatePath": "templates\\WslSshRelay.ps1",
   "sshPort": 2222,
   "wslMemoryLimit": "12GB",
-  "vmIdleTimeoutMs": 1800000,
+  "vmIdleTimeoutMs": 15000,
   "relayIdleShutdownSeconds": 300,
   "programDataScriptPath": "C:\\ProgramData\\WslSshLan\\WslSshRelay.ps1",
   "relayTaskName": "WSL SSH Relay"

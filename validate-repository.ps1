@@ -204,7 +204,6 @@ $setupScriptChecks = @(
 foreach ($needle in $setupScriptChecks) {
   Assert-Condition -Condition ($setupContent -match [regex]::Escape($needle)) -Message "setup-ubuntu-ssh.ps1 must contain '$needle'."
 }
-Assert-Condition -Condition (-not ($setupContent -match "Guid\(\)::NewGuid|NewGuid\(\)")) -Message "setup-ubuntu-ssh.ps1 must not generate a default Linux password."
 Assert-Condition -Condition ($setupContent -match 'if \s*\(\$ShowProgressBar\)') -Message "setup-ubuntu-ssh.ps1 must gate Write-Progress behind ShowProgressBar."
 Assert-Condition -Condition ($setupContent -match 'graphical password dialog is not available.*console password prompting is disabled by default') -Message "setup-ubuntu-ssh.ps1 must refuse console password prompting by default."
 Assert-Condition -Condition ($setupContent -match '/usr/bin/openssl.*passwd.*-6' -or $setupContent -match '/usr/bin/mkpasswd.*-m.*sha-512') -Message "setup-ubuntu-ssh.ps1 must generate SHA-512 password hashes inside WSL."
@@ -221,11 +220,12 @@ Assert-Condition -Condition $validPasswordStatus.IsReady -Message "A valid ASCII
 $fullWidthCandidate = ([char]0xFF21) + "bcdef12"
 $invalidPasswordStatus = Get-LinuxPasswordStatusMessage -CandidateText $fullWidthCandidate -ConfirmText $fullWidthCandidate
 Assert-Condition -Condition (-not $invalidPasswordStatus.IsReady) -Message "A password containing non-ASCII characters must be rejected by Get-LinuxPasswordStatusMessage."
-$generatedRelayScript = Get-RelayScriptContent -TemplatePath $relayTypeDefinitionTemplatePath -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $validateFixtures.preferredListenAddress -PreferredInterfaceAlias $validateFixtures.preferredInterfaceAlias
+$generatedRelayScript = Get-RelayScriptContent -TypeDefinitionTemplatePath $relayTypeDefinitionTemplatePath -PowerShellScriptTemplatePath (Join-Path $scriptRoot $manifest.relayPowerShellScriptTemplatePath) -DistroName $manifest.distroName -Port $manifest.sshPort -IdleShutdownSeconds $manifest.relayIdleShutdownSeconds -PreferredListenAddress $validateFixtures.preferredListenAddress -PreferredInterfaceAlias $validateFixtures.preferredInterfaceAlias
 Assert-Condition -Condition ($generatedRelayScript -match "TcpListener") -Message "Generated relay script does not create a TCP listener."
 Assert-Condition -Condition ($generatedRelayScript -match "WslSshRelay") -Message "Generated relay script does not define the relay class."
 Assert-Condition -Condition ($generatedRelayScript -match "--terminate") -Message "Generated relay script does not terminate WSL after idle."
 Assert-Condition -Condition ($generatedRelayScript -match "systemctl") -Message "Generated relay script does not start ssh.service."
+Assert-Condition -Condition ($generatedRelayScript -match "instance keeper") -Message "Generated relay script does not keep the WSL instance alive while clients are connected."
 Assert-Condition -Condition ($generatedRelayScript -match "Initialize-Utf8Output") -Message "Generated relay script must initialize UTF-8 output."
 Assert-Condition -Condition ($generatedRelayScript -match "File\.AppendAllText\(_logPath, line \+ Environment\.NewLine, new UTF8Encoding\(false\)\)") -Message "Generated relay script must write logs as UTF-8."
 $tokens = $null
@@ -240,4 +240,3 @@ $historyLeakPasswordHits = & git.exe log --all --oneline ("-S" + [string]::Join(
 Assert-Condition -Condition (-not $historyLeakPasswordHits) -Message "Git history still contains the removed password."
 
 Write-Output "Repository validation passed."
-

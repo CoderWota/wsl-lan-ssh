@@ -1,3 +1,26 @@
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+function Initialize-Utf8Output {
+  $utf8 = [System.Text.UTF8Encoding]::new($false)
+  try {
+    [Console]::InputEncoding = $utf8
+    [Console]::OutputEncoding = $utf8
+  } catch {
+    Write-Verbose "Console UTF-8 initialization was skipped. $($_.Exception.Message)"
+  }
+  Set-Variable -Scope Script -Name OutputEncoding -Value $utf8
+  if (-not (Get-Variable -Scope Script -Name PSDefaultParameterValues -ErrorAction SilentlyContinue)) {
+    Set-Variable -Scope Script -Name PSDefaultParameterValues -Value @{}
+  }
+  $script:PSDefaultParameterValues["Out-File:Encoding"] = "utf8"
+  $script:PSDefaultParameterValues["Set-Content:Encoding"] = "utf8"
+  $script:PSDefaultParameterValues["Add-Content:Encoding"] = "utf8"
+}
+
+Initialize-Utf8Output
+
+Add-Type -TypeDefinition @"
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -539,3 +562,15 @@ public sealed class WslSshRelay
         }
     }
 }
+
+"@
+
+$distroName = "Ubuntu"
+$port = "2222"
+$idleTimeout = "300"
+$preferredAddress = "192.168.0.251"
+$preferredAlias = "イーサネット"
+$logPath = "c:\\Users\\Wota\\Documents\\WSL\\state\\WslSshRelay.runtime.log"
+
+$relay = [WslSshRelay]::new($distroName, $port, $idleTimeout, $preferredAddress, $preferredAlias, $logPath)
+$relay.Run()
