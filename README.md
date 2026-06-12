@@ -28,7 +28,7 @@ Running `setup-ubuntu-ssh.ps1` will:
 - install or repair the managed WSL distro named `Ubuntu`
 - create or refresh the default Linux user from `setup-defaults.json`
 - prompt for a Linux password on first bootstrap, or when you explicitly reset it
-- install `openssh-server` inside Ubuntu
+- install required Ubuntu packages inside the managed distro, including `openssh-server`, `build-essential`, `jq`, `ripgrep`, `fd-find`, and `fzf`
 - write `/etc/wsl.conf`
 - write a managed SSH drop-in at `/etc/ssh/sshd_config.d/99-wsl-ssh-lan.conf`
 - create a Windows scheduled task named `WSL SSH Relay`

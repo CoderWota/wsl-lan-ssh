@@ -124,6 +124,24 @@ function ConvertTo-TemplateTokenValue {
   return $Text.Replace('"', '""')
 }
 
+function ConvertTo-LinuxPackageTokenList {
+  param([Parameter(Mandatory = $true)][string[]]$PackageNames)
+
+  $validatedPackageNames = foreach ($packageName in $PackageNames) {
+    $trimmedName = $packageName.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmedName)) {
+      throw "Linux package names must not be blank."
+    }
+    if ($trimmedName -notmatch '^[a-z0-9][a-z0-9+.-]*$') {
+      throw "Linux package name '$trimmedName' is invalid."
+    }
+
+    $trimmedName
+  }
+
+  return [string]::Join(" ", $validatedPackageNames)
+}
+
 function ConvertTo-LinuxSingleQuotedText {
   param([Parameter(Mandatory = $true)][string]$Text)
 
@@ -788,19 +806,47 @@ function Install-WslUbuntuDistro {
   }
 }
 
-function Install-OpenSshServerIfMissing {
-  param([Parameter(Mandatory = $true)][string]$DistroName)
+function Get-LinuxPackageInstallScriptContent {
+  param(
+    [Parameter(Mandatory = $true)][string]$TemplatePath,
+    [Parameter(Mandatory = $true)][string[]]$RequiredBasePackages,
+    [Parameter(Mandatory = $true)][string[]]$BootstrapPackages
+  )
 
-  try {
-    Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/dpkg", "-s", "openssh-server") -Description "Check OpenSSH server package"
-    return $false
-  } catch {
-    Write-Verbose "OpenSSH server package is not installed in distro '$DistroName'. Installing it now."
+  $templateSource = Read-TextFileIfPresent -Path $TemplatePath
+  if ($null -eq $templateSource) {
+    throw "Linux package install template is missing: $TemplatePath"
   }
 
-  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/apt-get", "update") -Description "Update Linux package lists"
-  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "/usr/bin/apt-get", "install", "-y", "openssh-server") -Description "Install OpenSSH server"
-  return $true
+  $requiredPackageTokenList = ConvertTo-LinuxPackageTokenList -PackageNames $RequiredBasePackages
+  $bootstrapPackageTokenList = ConvertTo-LinuxPackageTokenList -PackageNames $BootstrapPackages
+  return ($templateSource.Replace("__REQUIRED_BASE_PACKAGES__", $requiredPackageTokenList).
+    Replace("__BOOTSTRAP_PACKAGES__", $bootstrapPackageTokenList))
+}
+
+function Install-LinuxBootstrapPackages {
+  param(
+    [Parameter(Mandatory = $true)][string]$DistroName,
+    [Parameter(Mandatory = $true)][string]$TemplatePath,
+    [Parameter(Mandatory = $true)][string[]]$RequiredBasePackages,
+    [Parameter(Mandatory = $true)][string[]]$BootstrapPackages
+  )
+
+  $scriptPath = "/var/lib/wslssh-lan/install-bootstrap-packages.sh"
+  $scriptContent = Get-LinuxPackageInstallScriptContent -TemplatePath $TemplatePath -RequiredBasePackages $RequiredBasePackages -BootstrapPackages $BootstrapPackages
+  Write-LinuxTextFile -DistroName $DistroName -Path $scriptPath -Text $scriptContent -DirectoryMode "700" -FileMode "700"
+
+  $output = Invoke-NativeCommandWithHeartbeat `
+    -FilePath "wsl.exe" `
+    -Arguments @("--distribution", $DistroName, "--user", "root", "--exec", "/bin/sh", $scriptPath) `
+    -Description "Install Ubuntu bootstrap packages" `
+    -HeartbeatMessage "Step 6 detail: Ubuntu package installation is still running inside WSL. Please wait..."
+
+  foreach ($line in $output) {
+    if (-not [string]::IsNullOrWhiteSpace($line)) {
+      Write-Output $line
+    }
+  }
 }
 
 function Initialize-LinuxBootstrapConfiguration {
@@ -1063,6 +1109,7 @@ $manifestPath = Join-Path $scriptRoot "manifest.json"
 $manifest = Read-JsonFile -Path $manifestPath
 $setupDefaultsPath = Join-Path $scriptRoot $manifest.setupDefaultsPath
 $linuxSecurityProfilePath = Join-Path $scriptRoot $manifest.linuxSecurityProfilePath
+$linuxPackageInstallTemplatePath = Join-Path $scriptRoot $manifest.linuxPackageInstallTemplatePath
 $relayTypeDefinitionTemplatePath = Join-Path $scriptRoot $manifest.relayTypeDefinitionTemplatePath
 $relayPowerShellScriptTemplatePath = Join-Path $scriptRoot $manifest.relayPowerShellScriptTemplatePath
 if (-not (Test-Path -LiteralPath $setupDefaultsPath)) {
@@ -1070,6 +1117,9 @@ if (-not (Test-Path -LiteralPath $setupDefaultsPath)) {
 }
 if (-not (Test-Path -LiteralPath $linuxSecurityProfilePath)) {
   throw "Linux security profile file is missing: $linuxSecurityProfilePath"
+}
+if (-not (Test-Path -LiteralPath $linuxPackageInstallTemplatePath)) {
+  throw "Linux package install template file is missing: $linuxPackageInstallTemplatePath"
 }
 if (-not (Test-Path -LiteralPath $relayTypeDefinitionTemplatePath)) {
   throw "Relay C# type definition template file is missing: $relayTypeDefinitionTemplatePath"
@@ -1089,7 +1139,11 @@ if (-not ($linuxSecurityProfile.PSObject.Properties.Name -contains "wslConfTempl
 if (-not ($linuxSecurityProfile.PSObject.Properties.Name -contains "sshdTemplateLines") -or -not $linuxSecurityProfile.sshdTemplateLines) {
   throw "Linux security profile is missing 'sshdTemplateLines'."
 }
+if (-not ($manifest.PSObject.Properties.Name -contains "linuxBootstrapPackages") -or -not $manifest.linuxBootstrapPackages) {
+  throw "manifest.json is missing 'linuxBootstrapPackages'."
+}
 $defaultLinuxUser = [string]$setupDefaults.defaultLinuxUser
+$linuxBootstrapPackages = [string[]]$manifest.linuxBootstrapPackages
 
 $stateDir = Join-Path $scriptRoot "state"
 $statePath = Join-Path $stateDir "setup-state.json"
@@ -1240,8 +1294,8 @@ try {
     $setLinuxUserParams.PasswordSecure = $setupCredentials.PasswordSecure
   }
   Set-LinuxUserConfigured @setLinuxUserParams
-  Write-SetupStatus -Step 6 -Message "Installing OpenSSH and writing Linux-side WSL and SSH configuration."
-  Install-OpenSshServerIfMissing -DistroName $manifest.distroName
+  Write-SetupStatus -Step 6 -Message "Installing required Ubuntu packages and writing Linux-side WSL and SSH configuration."
+  Install-LinuxBootstrapPackages -DistroName $manifest.distroName -TemplatePath $linuxPackageInstallTemplatePath -RequiredBasePackages @("apt") -BootstrapPackages $linuxBootstrapPackages
   Initialize-LinuxBootstrapConfiguration -DistroName $manifest.distroName -LinuxUser $linuxUser -SshPort $manifest.sshPort -SecurityProfile $linuxSecurityProfile
   Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--shutdown") -Description "Apply Linux bootstrap configuration"
 

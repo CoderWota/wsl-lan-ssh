@@ -52,6 +52,7 @@ function Get-FunctionScriptBlock {
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $manifestPath = Join-Path $scriptRoot "manifest.json"
 $linuxSecurityProfilePath = $null
+$linuxPackageInstallTemplatePath = $null
 $relayTypeDefinitionTemplatePath = $null
 $validateFixturesPath = Join-Path $scriptRoot "validate-fixtures.json"
 $setupPath = Join-Path $scriptRoot "setup-ubuntu-ssh.ps1"
@@ -65,9 +66,11 @@ Assert-Condition -Condition (Test-Path -LiteralPath $uninstallPath) -Message "un
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $setupDefaultsPath = Join-Path $scriptRoot $manifest.setupDefaultsPath
 $linuxSecurityProfilePath = Join-Path $scriptRoot $manifest.linuxSecurityProfilePath
+$linuxPackageInstallTemplatePath = Join-Path $scriptRoot $manifest.linuxPackageInstallTemplatePath
 $relayTypeDefinitionTemplatePath = Join-Path $scriptRoot $manifest.relayTypeDefinitionTemplatePath
 Assert-Condition -Condition (Test-Path -LiteralPath $setupDefaultsPath) -Message "setup-defaults.json is missing."
 Assert-Condition -Condition (Test-Path -LiteralPath $linuxSecurityProfilePath) -Message "linux-security-profile.json is missing."
+Assert-Condition -Condition (Test-Path -LiteralPath $linuxPackageInstallTemplatePath) -Message "Linux package install template is missing."
 Assert-Condition -Condition (Test-Path -LiteralPath $relayTypeDefinitionTemplatePath) -Message "Relay C# type definition template is missing."
 $setupDefaults = Get-Content -LiteralPath $setupDefaultsPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $linuxSecurityProfile = Get-Content -LiteralPath $linuxSecurityProfilePath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -77,7 +80,9 @@ $requiredFields = @(
   "linuxSetupConfigPath",
   "setupDefaultsPath",
   "linuxSecurityProfilePath",
+  "linuxPackageInstallTemplatePath",
   "relayTypeDefinitionTemplatePath",
+  "linuxBootstrapPackages",
   "sshPort",
   "wslMemoryLimit",
   "vmIdleTimeoutMs",
@@ -101,8 +106,12 @@ Assert-Condition -Condition ($linuxSecurityProfile.PSObject.Properties.Name -con
 Assert-Condition -Condition ($linuxSecurityProfile.PSObject.Properties.Name -contains "sshdTemplateLines") -Message "linux-security-profile.json is missing 'sshdTemplateLines'."
 Assert-Condition -Condition ($linuxSecurityProfile.wslConfTemplateLines.Count -gt 0) -Message "linux-security-profile.json wslConfTemplateLines must not be empty."
 Assert-Condition -Condition ($linuxSecurityProfile.sshdTemplateLines.Count -gt 0) -Message "linux-security-profile.json sshdTemplateLines must not be empty."
+Assert-Condition -Condition ($manifest.linuxBootstrapPackages.Count -gt 0) -Message "manifest.json linuxBootstrapPackages must not be empty."
 
 Assert-Condition -Condition ($setupDefaults.defaultLinuxUser -match '^[a-z_][a-z0-9_-]*$') -Message "setup-defaults.json defaultLinuxUser is invalid."
+foreach ($packageName in [string[]]$manifest.linuxBootstrapPackages) {
+  Assert-Condition -Condition ($packageName -match '^[a-z0-9][a-z0-9+.-]*$') -Message "manifest.json contains an invalid Linux package name: $packageName"
+}
 
 $requiredFixtureFields = @(
   "preferredListenAddress",
@@ -137,11 +146,13 @@ Assert-Condition -Condition (-not ($manifest.PSObject.Properties.Name -contains 
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-WslConfigContent")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Read-TextFileIfPresent")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "ConvertTo-TemplateTokenValue")
+. (Get-FunctionScriptBlock -Ast $setupAst -Name "ConvertTo-LinuxPackageTokenList")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-FirewallRuleDisplayName")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-LinuxWslConfigContent")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-LinuxSshdConfigContent")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Install-WslUbuntuDistro")
-. (Get-FunctionScriptBlock -Ast $setupAst -Name "Install-OpenSshServerIfMissing")
+. (Get-FunctionScriptBlock -Ast $setupAst -Name "Get-LinuxPackageInstallScriptContent")
+. (Get-FunctionScriptBlock -Ast $setupAst -Name "Install-LinuxBootstrapPackages")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Initialize-LinuxBootstrapConfiguration")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "ConvertTo-LinuxSingleQuotedText")
 . (Get-FunctionScriptBlock -Ast $setupAst -Name "Test-LinuxPathPresent")
@@ -187,7 +198,9 @@ $setupScriptChecks = @(
   "--install",
   "--web-download",
   "--no-launch",
-  "openssh-server",
+  "Install-LinuxBootstrapPackages",
+  "linuxBootstrapPackages",
+  "linuxPackageInstallTemplatePath",
   "99-wsl-ssh-lan.conf",
   "New-NetFirewallRule",
   "wslConfigBackupContent",
@@ -228,6 +241,11 @@ Assert-Condition -Condition ($generatedRelayScript -match "systemctl") -Message 
 Assert-Condition -Condition ($generatedRelayScript -match "instance keeper") -Message "Generated relay script does not keep the WSL instance alive while clients are connected."
 Assert-Condition -Condition ($generatedRelayScript -match "Initialize-Utf8Output") -Message "Generated relay script must initialize UTF-8 output."
 Assert-Condition -Condition ($generatedRelayScript -match "File\.AppendAllText\(_logPath, line \+ Environment\.NewLine, new UTF8Encoding\(false\)\)") -Message "Generated relay script must write logs as UTF-8."
+$generatedLinuxPackageScript = Get-LinuxPackageInstallScriptContent -TemplatePath $linuxPackageInstallTemplatePath -RequiredBasePackages @("apt") -BootstrapPackages ([string[]]$manifest.linuxBootstrapPackages)
+Assert-Condition -Condition ($generatedLinuxPackageScript -match "apt-get update") -Message "Generated Linux package install script must refresh apt indexes."
+Assert-Condition -Condition ($generatedLinuxPackageScript -match "openssh-server") -Message "Generated Linux package install script must include openssh-server."
+Assert-Condition -Condition ($generatedLinuxPackageScript -match "fd-find") -Message "Generated Linux package install script must include fd-find."
+Assert-Condition -Condition ($generatedLinuxPackageScript -match 'Required base package ''\$package_name'' is missing') -Message "Generated Linux package install script must validate required base packages."
 $tokens = $null
 $errors = $null
 [void][System.Management.Automation.Language.Parser]::ParseInput($generatedRelayScript, [ref]$tokens, [ref]$errors)
