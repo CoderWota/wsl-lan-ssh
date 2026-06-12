@@ -130,6 +130,21 @@ function ConvertTo-LinuxSingleQuotedText {
   return "'" + ($Text -replace "'", "'""'""'") + "'"
 }
 
+function ConvertFrom-NativeCommandText {
+  param([AllowNull()]$Value)
+
+  if ($null -eq $Value) {
+    return $null
+  }
+
+  $text = [string]$Value
+  if ($text.IndexOf([char]0) -ge 0) {
+    $text = $text.Replace([string][char]0, "")
+  }
+
+  return $text.Trim([char]0xFEFF)
+}
+
 function Invoke-NativeCommand {
   param(
     [Parameter(Mandatory = $true)][string]$FilePath,
@@ -143,13 +158,47 @@ function Invoke-NativeCommand {
   } else {
     & $FilePath @Arguments 2>&1
   }
+  $normalizedOutput = @($output | ForEach-Object { ConvertFrom-NativeCommandText -Value $_ })
   $exitCode = $LASTEXITCODE
   if ($exitCode -ne 0) {
-    $message = @($output) -join [Environment]::NewLine
+    $message = $normalizedOutput -join [Environment]::NewLine
     throw "$Description failed with exit code $exitCode. $message"
   }
 
-  return $output
+  return $normalizedOutput
+}
+
+function Invoke-NativeCommandWithHeartbeat {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [Parameter(Mandatory = $true)][string[]]$Arguments,
+    [Parameter(Mandatory = $true)][string]$Description,
+    [Parameter(Mandatory = $true)][string]$HeartbeatMessage,
+    [int]$HeartbeatIntervalSeconds = 20
+  )
+
+  $sourceIdentifier = "SetupHeartbeat_$([Guid]::NewGuid().ToString('N'))"
+  $timer = [System.Timers.Timer]::new($HeartbeatIntervalSeconds * 1000)
+  $timer.AutoReset = $true
+  $subscription = $null
+
+  try {
+    $subscription = Register-ObjectEvent -InputObject $timer -EventName Elapsed -SourceIdentifier $sourceIdentifier -MessageData $HeartbeatMessage -Action {
+      Write-Host $event.MessageData
+    }
+    $timer.Start()
+
+    return Invoke-NativeCommand -FilePath $FilePath -Arguments $Arguments -Description $Description
+  } finally {
+    if ($null -ne $timer) {
+      $timer.Stop()
+      $timer.Dispose()
+    }
+    if ($null -ne $subscription) {
+      Unregister-Event -SourceIdentifier $sourceIdentifier -ErrorAction SilentlyContinue
+      Remove-Job -Name $sourceIdentifier -Force -ErrorAction SilentlyContinue
+    }
+  }
 }
 
 function Test-LinuxPathPresent {
@@ -726,7 +775,12 @@ function Install-WslUbuntuDistro {
     }
   }
 
-  Invoke-NativeCommand -FilePath "wsl.exe" -Arguments @("--install", "-d", $DistroName, "--web-download", "--no-launch") -Description "Install WSL distro '$DistroName'" | Out-Null
+  Write-Host "Step 3 detail: WSL is downloading or repairing Ubuntu. This step can take several minutes on the first run."
+  Invoke-NativeCommandWithHeartbeat `
+    -FilePath "wsl.exe" `
+    -Arguments @("--install", "-d", $DistroName, "--web-download", "--no-launch") `
+    -Description "Install WSL distro '$DistroName'" `
+    -HeartbeatMessage "Step 3 detail: Ubuntu installation is still running inside WSL. Please wait..." | Out-Null
 
   return [pscustomobject]@{
     InstalledNow = $true
