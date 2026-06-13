@@ -20,10 +20,11 @@
     "AllowUsers __DEFAULT_LINUX_USER__",
     "",
     "X11Forwarding no",
-    "AllowTcpForwarding no",
+    "AllowTcpForwarding yes",
+    "AllowStreamLocalForwarding yes",
     "AllowAgentForwarding no",
     "PermitTunnel no",
-    "DisableForwarding yes",
+    "DisableForwarding no",
     "PermitUserEnvironment no",
     "MaxAuthTries 3",
     "LoginGraceTime 30"

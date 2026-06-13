@@ -938,6 +938,7 @@ function Get-WslConfigContent {
     "[wsl2]",
     "memory=$MemoryLimit",
     "networkingMode=nat",
+    "localhostForwarding=true",
     "firewall=true",
     "vmIdleTimeout=$VmIdleTimeoutMs",
     "",

@@ -24,7 +24,9 @@ The default managed SSH policy is:
 - password login enabled
 - root login disabled
 - `AllowUsers ubuntu`
-- forwarding features disabled
+- TCP forwarding enabled for VS Code Remote-SSH
+- stream-local forwarding enabled for VS Code Remote-SSH
+- agent forwarding disabled
 
 ## Quick Start
 
@@ -76,6 +78,7 @@ Useful defaults:
 - SSH port: `2222`
 - default Linux user: `ubuntu`
 - WSL memory limit: `12GB`
+- `%USERPROFILE%\.wslconfig` includes `localhostForwarding=true`
 
 ## Uninstall
 

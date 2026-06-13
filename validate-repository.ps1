@@ -173,6 +173,7 @@ $expectedWslConfig = @(
   "[wsl2]",
   "memory=$($manifest.wslMemoryLimit)",
   "networkingMode=nat",
+  "localhostForwarding=true",
   "firewall=true",
   "vmIdleTimeout=$($manifest.vmIdleTimeoutMs)",
   "",
