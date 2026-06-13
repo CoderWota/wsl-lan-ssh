@@ -928,6 +928,48 @@ function Test-TaskPresent {
   return [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
 }
 
+function Get-RelayProcessIds {
+  param([Parameter(Mandatory = $true)][string]$ScriptPath)
+
+  $escapedScriptPath = [regex]::Escape($ScriptPath)
+  $processes = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    $_.CommandLine -and $_.CommandLine -match $escapedScriptPath
+  }
+
+  if (-not $processes) {
+    return @()
+  }
+
+  return @($processes | ForEach-Object { [int]$_.ProcessId })
+}
+
+function Stop-RelayProcesses {
+  [CmdletBinding()]
+  param([Parameter(Mandatory = $true)][string]$ScriptPath)
+
+  $processIds = @(Get-RelayProcessIds -ScriptPath $ScriptPath)
+  foreach ($processId in $processIds) {
+    try {
+      Stop-Process -Id $processId -Force -ErrorAction Stop
+    } catch {
+      Write-Verbose "Failed to stop relay process $processId. $($_.Exception.Message)"
+    }
+  }
+}
+
+function Start-RelayProcessWithoutBlocking {
+  [CmdletBinding()]
+  param([Parameter(Mandatory = $true)][string]$ScriptPath)
+
+  $existingProcessIds = @(Get-RelayProcessIds -ScriptPath $ScriptPath)
+  if ($existingProcessIds.Count -gt 0) {
+    Write-Verbose "Relay script '$ScriptPath' is already running in process id(s): $($existingProcessIds -join ', ')."
+    return
+  }
+
+  Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $ScriptPath) -WindowStyle Hidden | Out-Null
+}
+
 function Get-WslConfigContent {
   param(
     [Parameter(Mandatory = $true)][string]$MemoryLimit,
@@ -1050,6 +1092,7 @@ function Restore-PartialSetup {
     Stop-ScheduledTask -TaskName $RelayTaskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $RelayTaskName -Confirm:$false -ErrorAction SilentlyContinue
   }
+  Stop-RelayProcesses -ScriptPath $ProgramDataScriptPath
 
   if ($ProgramDataScriptCreated -and (Test-Path -LiteralPath $ProgramDataScriptPath)) {
     Remove-Item -LiteralPath $ProgramDataScriptPath -Force -ErrorAction SilentlyContinue
@@ -1189,6 +1232,7 @@ if (Test-TaskPresent -TaskName $manifest.relayTaskName) {
   Stop-ScheduledTask -TaskName $manifest.relayTaskName -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $manifest.relayTaskName -Confirm:$false
 }
+Stop-RelayProcesses -ScriptPath $programDataScriptPath
 
 if (Test-Path -LiteralPath $programDataScriptPath) {
   Remove-Item -LiteralPath $programDataScriptPath -Force
@@ -1348,8 +1392,7 @@ try {
   Register-ScheduledTask -TaskName $manifest.relayTaskName -Action $relayAction -Trigger @($relayBootTrigger, $relayLogonTrigger) -Principal $relayPrincipal -Settings $relaySettings -Force | Out-Null
   $relayTaskCreated = $true
 
-  Start-ScheduledTask -TaskName $manifest.relayTaskName
-  Start-Sleep -Seconds 2
+  Start-RelayProcessWithoutBlocking -ScriptPath $programDataScriptPath
 
   $state = [ordered]@{
     windowsUser = $currentUser

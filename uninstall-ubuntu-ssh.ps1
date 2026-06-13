@@ -109,6 +109,35 @@ function Get-FirewallRuleDisplayName {
   return "WSL SSH LAN $Port"
 }
 
+function Get-RelayProcessIds {
+  param([Parameter(Mandatory = $true)][string]$ScriptPath)
+
+  $escapedScriptPath = [regex]::Escape($ScriptPath)
+  $processes = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    $_.CommandLine -and $_.CommandLine -match $escapedScriptPath
+  }
+
+  if (-not $processes) {
+    return @()
+  }
+
+  return @($processes | ForEach-Object { [int]$_.ProcessId })
+}
+
+function Stop-RelayProcesses {
+  [CmdletBinding()]
+  param([Parameter(Mandatory = $true)][string]$ScriptPath)
+
+  $processIds = @(Get-RelayProcessIds -ScriptPath $ScriptPath)
+  foreach ($processId in $processIds) {
+    try {
+      Stop-Process -Id $processId -Force -ErrorAction Stop
+    } catch {
+      Write-Verbose "Failed to stop relay process $processId. $($_.Exception.Message)"
+    }
+  }
+}
+
 if (-not (Test-IsAdministrator)) {
   throw "Run this script from an elevated PowerShell session."
 }
@@ -127,6 +156,7 @@ if (Get-ScheduledTask -TaskName $manifest.relayTaskName -ErrorAction SilentlyCon
   Stop-ScheduledTask -TaskName $manifest.relayTaskName -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $manifest.relayTaskName -Confirm:$false
 }
+Stop-RelayProcesses -ScriptPath $manifest.programDataScriptPath
 
 if (Test-Path -LiteralPath $manifest.programDataScriptPath) {
   Remove-Item -LiteralPath $manifest.programDataScriptPath -Force
